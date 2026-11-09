@@ -27,6 +27,7 @@ import { TimeOfDayPicker, DurationPicker, NumberWheelPicker } from "@/components
 import { useTour } from "@/hooks/useTour";
 import { buttonVariants } from "@/components/ui/button";
 import { useToast } from "@/components/ui/Toast";
+import { CALC_DEBUG_KEY } from "@/lib/devFlags";
 import "driver.js/dist/driver.css";
 
 type GoalIndicator = {
@@ -188,6 +189,10 @@ export default function Home() {
   const hasRequired = metrics.some((m) => m.required);
 
   const [showCalcDebug, setShowCalcDebug] = useState(false);
+  // Calc debug is a developer aid toggled from Settings (stored per device).
+  useEffect(() => {
+    setShowCalcDebug(localStorage.getItem(CALC_DEBUG_KEY) === "1");
+  }, []);
   const [hasShownHeadsUp, setHasShownHeadsUp] = useState(false);
 
   const [collapsedGroups, setCollapsedGroups] = useState<Record<string, boolean>>({});
@@ -480,7 +485,7 @@ export default function Home() {
           fetch("/api/config", { headers }),
           fetch("/api/date_hints", { headers }),
           fetch("/api/settings", { headers }),
-          fetch("/api/log", { headers }),
+          fetch("/api/log?years=1", { headers }),
         ]);
 
         // Config
@@ -532,19 +537,9 @@ export default function Home() {
           setUserSettings(await settingsRes.json());
         }
 
-        // Available years
+        // Available years (server returns newest-first, current year included)
         if (logsRes.ok) {
-          const logs = await logsRes.json();
-          const years = new Set<number>();
-          for (const log of logs) {
-            if (log.date) {
-              const year = parseInt(log.date.slice(0, 4));
-              if (!isNaN(year)) years.add(year);
-            }
-          }
-          const currentYear = new Date().getFullYear();
-          years.add(currentYear);
-          setAvailableYears(Array.from(years).sort((a, b) => b - a));
+          setAvailableYears((await logsRes.json()) as number[]);
         } else {
           const currentYear = new Date().getFullYear();
           setAvailableYears(Array.from({ length: 5 }, (_, i) => currentYear - i));
@@ -1895,34 +1890,11 @@ export default function Home() {
 
       {/* Main Content */}
       <main className="flex-1 p-6 max-w-3xl mx-auto w-full space-y-6">
-        <h1 className="text-2xl font-semibold">Daily Tracker</h1>
-
-        <div className="space-y-2">
-          {gapMessage && (
-            <div
-              style={{
-                display: "inline-block",
-                padding: "2px 6px",
-                fontSize: "0.75rem",
-                borderRadius: 4,
-                backgroundColor: "#FEF9C3",
-                border: "1px solid #FACC15",
-                color: "#78350F",
-              }}
-            >
-              {gapMessage}
-            </div>
-          )}
-
-          <label style={{ display: "inline-flex", gap: 8, alignItems: "center" }}>
-            <input
-              type="checkbox"
-              checked={showCalcDebug}
-              onChange={(e) => setShowCalcDebug(e.target.checked)}
-            />
-            <span className="text-sm">Show calc debug</span>
-          </label>
-        </div>
+        {gapMessage && (
+          <div className="inline-block text-xs px-2 py-1 rounded border text-amber-800 dark:text-amber-300 bg-amber-50 dark:bg-amber-900/30 border-amber-300 dark:border-amber-700">
+            {gapMessage}
+          </div>
+        )}
     {/*
       {dateHints &&
         dateHints.missing_required_days > 0 &&
@@ -2470,7 +2442,7 @@ export default function Home() {
                                 </Badge>
                               )}
                               <Input
-                                inputMode={["number", "score", "count"].includes(m.type) ? "numeric" : undefined}
+                                inputMode={m.type === "number" ? "decimal" : m.type === "score" || m.type === "count" ? "numeric" : undefined}
                                 placeholder={m.type === "hhmm" ? "e.g. 22:30" : m.type === "time" ? "e.g. 90 or 1:30" : m.type === "score" ? "1–10" : m.type === "count" ? "0, 1, 2…" : undefined}
                                 value={raw}
                                 onFocus={() => markAsTouched(m.metric_id)}

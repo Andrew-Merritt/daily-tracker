@@ -9,6 +9,8 @@ export async function GET(req: Request) {
   const start = searchParams.get("start");
   const end = searchParams.get("end");
   const year = searchParams.get("year"); // Optional year filter for heatmap
+  const metricId = searchParams.get("metric_id"); // Optional single-metric filter
+  const yearsOnly = searchParams.get("years") === "1"; // Just list years that have data
 
   const {
     data: { user },
@@ -17,6 +19,28 @@ export async function GET(req: Request) {
 
   if (userError || !user) {
     return NextResponse.json({ error: "Not authenticated" }, { status: 401 });
+  }
+
+  // Years with data: one indexed lookup of the earliest log date instead of
+  // shipping the whole history to the client. Returns newest-first, always
+  // including the current year.
+  if (yearsOnly) {
+    const { data, error } = await supabase
+      .from("log")
+      .select("date")
+      .eq("owner_id", user.id)
+      .order("date", { ascending: true })
+      .limit(1);
+
+    if (error) {
+      return NextResponse.json({ error: error.message }, { status: 500 });
+    }
+    const currentYear = new Date().getFullYear();
+    const firstYear = data?.[0]?.date ? parseInt(String(data[0].date).slice(0, 4), 10) : currentYear;
+    const start = Number.isFinite(firstYear) ? Math.min(firstYear, currentYear) : currentYear;
+    const years: number[] = [];
+    for (let y = currentYear; y >= start; y--) years.push(y);
+    return NextResponse.json(years);
   }
 
   // Single date query - no pagination needed
@@ -54,6 +78,7 @@ export async function GET(req: Request) {
     if (year) {
       q = q.gte("date", `${year}-01-01`).lte("date", `${year}-12-31`);
     }
+    if (metricId) q = q.eq("metric_id", metricId);
 
     const { data, error } = await q;
 

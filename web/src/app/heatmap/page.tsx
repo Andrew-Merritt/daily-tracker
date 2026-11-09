@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useMemo, useCallback } from "react";
+import { useEffect, useState, useMemo, useCallback, useRef } from "react";
 import { getAuthHeaders } from "@/lib/authHeaders";
 import {
   CalendarHeatmap,
@@ -152,33 +152,58 @@ export default function HeatmapPage() {
     })();
   }, []);
 
-  // Load log data for selected year (with year filter for performance)
+  // Load just the selected metric for the selected year. Results are cached per
+  // year+metric so flipping back and forth doesn't refetch.
+  const logCache = useRef(new Map<string, LogRow[]>());
   useEffect(() => {
     if (!selectedMetric) return;
+    const key = `${selectedYear}:${selectedMetric}`;
+    const cached = logCache.current.get(key);
+    if (cached) {
+      setLogData(cached);
+      return;
+    }
 
+    let cancelled = false;
     (async () => {
       try {
         const headers = await getAuthHeaders();
-        const logRes = await fetch(`/api/log?year=${selectedYear}`, { headers });
+        const params = new URLSearchParams({ year: String(selectedYear), metric_id: selectedMetric });
+        const logRes = await fetch(`/api/log?${params}`, { headers });
         const logDataRes = await logRes.json();
 
         if (!logRes.ok) throw new Error(logDataRes?.error || "Failed to load logs");
-        setLogData(logDataRes);
+        logCache.current.set(key, logDataRes);
+        if (!cancelled) setLogData(logDataRes);
       } catch (e) {
-        setError(e instanceof Error ? e.message : String(e));
+        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
       }
     })();
+    return () => {
+      cancelled = true;
+    };
   }, [selectedYear, selectedMetric]);
 
-  // Available years - show current year and previous 5 years
-  const availableYears = useMemo(() => {
+  // Years that actually have data (newest first). Falls back to the last 6 years.
+  const [availableYears, setAvailableYears] = useState<number[]>(() => {
     const currentYear = new Date().getFullYear();
-    const years: number[] = [];
-    for (let y = currentYear; y >= currentYear - 5; y--) {
-      years.push(y);
-    }
-    return years;
+    return Array.from({ length: 6 }, (_, i) => currentYear - i);
+  });
+  useEffect(() => {
+    (async () => {
+      try {
+        const headers = await getAuthHeaders();
+        const res = await fetch("/api/log?years=1", { headers });
+        if (!res.ok) return;
+        const years = (await res.json()) as number[];
+        if (Array.isArray(years) && years.length > 0) setAvailableYears(years);
+      } catch {
+        // keep fallback
+      }
+    })();
   }, []);
+  const minYear = availableYears[availableYears.length - 1];
+  const maxYear = availableYears[0];
 
   // Get selected metric config
   const selectedConfig = useMemo(() => {
@@ -384,7 +409,7 @@ export default function HeatmapPage() {
               variant="outline"
               size="sm"
               onClick={() => setSelectedYear((y) => y - 1)}
-              disabled={selectedYear <= 2015}
+              disabled={selectedYear <= minYear}
             >
               &lt;
             </Button>
@@ -407,7 +432,7 @@ export default function HeatmapPage() {
               variant="outline"
               size="sm"
               onClick={() => setSelectedYear((y) => y + 1)}
-              disabled={selectedYear >= new Date().getFullYear()}
+              disabled={selectedYear >= maxYear}
             >
               &gt;
             </Button>
