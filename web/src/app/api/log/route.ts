@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { supabaseServerFromRequest } from "@/lib/supabaseServer";
+import { fetchAllRows } from "@/lib/fetchAllRows";
 
 export async function GET(req: Request) {
   const supabase = supabaseServerFromRequest(req);
@@ -58,41 +59,28 @@ export async function GET(req: Request) {
     return NextResponse.json(data ?? []);
   }
 
-  // For range queries or full data fetch, use pagination to get all rows
-  // (Supabase has a default row limit, typically 1000)
-  const rows: unknown[] = [];
-  const pageSize = 1000;
-  let from = 0;
-  const maxPages = 5000; // safety limit
+  // For range queries or full data fetch, page past Supabase's 1000-row limit
+  // (pages fetched in parallel; metric_id tiebreaker keeps paging stable).
+  let rows: unknown[];
+  try {
+    rows = await fetchAllRows<unknown>((withCount) => {
+      let q = supabase
+        .from("log")
+        .select("date,metric_id,value,value_text", withCount ? { count: "exact" } : undefined)
+        .eq("owner_id", user.id)
+        .order("date", { ascending: true })
+        .order("metric_id", { ascending: true });
 
-  for (let page = 0; page < maxPages; page++) {
-    let q = supabase
-      .from("log")
-      .select("date,metric_id,value,value_text")
-      .eq("owner_id", user.id)
-      .order("date", { ascending: true })
-      .range(from, from + pageSize - 1);
-
-    if (start) q = q.gte("date", start);
-    if (end) q = q.lte("date", end);
-    if (year) {
-      q = q.gte("date", `${year}-01-01`).lte("date", `${year}-12-31`);
-    }
-    if (metricId) q = q.eq("metric_id", metricId);
-
-    const { data, error } = await q;
-
-    if (error) {
-      return NextResponse.json({ error: error.message }, { status: 500 });
-    }
-
-    const batch = data ?? [];
-    rows.push(...batch);
-
-    // If we got fewer than a full page, we're done
-    if (batch.length < pageSize) break;
-
-    from += pageSize;
+      if (start) q = q.gte("date", start);
+      if (end) q = q.lte("date", end);
+      if (year) {
+        q = q.gte("date", `${year}-01-01`).lte("date", `${year}-12-31`);
+      }
+      if (metricId) q = q.eq("metric_id", metricId);
+      return q;
+    });
+  } catch (e) {
+    return NextResponse.json({ error: e instanceof Error ? e.message : String(e) }, { status: 500 });
   }
 
   return NextResponse.json(rows);

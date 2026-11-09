@@ -1638,11 +1638,13 @@ export default function Home() {
       }
 
       setDirty(false);
-      await Promise.all([
-        loadDayValues(date),
-        reloadDateHints(),
-        reloadIndicators(),
-      ]);
+      // Reload the saved day so the form reflects server state, but don't hold
+      // the Save button on the heavier date-hint / streak-indicator refreshes —
+      // those update in the background.
+      void reloadDateHints();
+      void reloadIndicators();
+      await loadDayValues(date);
+      toast("Saved", "success");
     } catch (e: any) {
       setError(String(e?.message || e));
     } finally {
