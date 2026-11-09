@@ -67,4 +67,11 @@ export class WebSpeechProvider implements STTProvider {
       this.recognition = null;
     }
   }
+
+  cancel(): void {
+    if (this.recognition) {
+      this.recognition.abort();
+      this.recognition = null;
+    }
+  }
 }
