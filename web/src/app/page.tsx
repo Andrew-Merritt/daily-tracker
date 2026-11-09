@@ -587,7 +587,14 @@ export default function Home() {
     if (!dateHints) return;
     if (dateInitializedFromHints) return;
 
-    const nextDate = dateHints.suggested_date || dateHints.today;
+    // A deep link (/?date=YYYY-MM-DD, e.g. "Edit this day" from the heatmap)
+    // wins over the suggested date. Strip it afterwards so a refresh or the
+    // back button behaves normally.
+    const linked = new URLSearchParams(window.location.search).get("date");
+    const linkedOk = !!linked && /^\d{4}-\d{2}-\d{2}$/.test(linked) && linked <= dateHints.today;
+    if (linked) window.history.replaceState(null, "", window.location.pathname);
+
+    const nextDate = linkedOk ? linked : dateHints.suggested_date || dateHints.today;
     if (nextDate) setDate(nextDate);
 
     // Decide Heads Up exactly once, at initial auto-jump

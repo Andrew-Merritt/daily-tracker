@@ -19,7 +19,7 @@ export type YearGridProps = {
   year?: number;
   selectedDate?: string | null;
   onHover?: (cell: { date: string; value: number } | null) => void;
-  onCellClick?: (date: string, value: number) => void;
+  onCellClick?: (date: string, value: number | undefined) => void;
 };
 
 const DAY_LABELS = ["", "M", "", "W", "", "F", ""];

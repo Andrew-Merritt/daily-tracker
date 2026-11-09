@@ -19,7 +19,7 @@ export type CalendarHeatmapProps = {
   year?: number;
   selectedDate?: string | null;
   onHover?: (cell: { date: string; value: number } | null) => void;
-  onCellClick?: (date: string, value: number) => void;
+  onCellClick?: (date: string, value: number | undefined) => void;
 };
 
 function formatHHMM(totalMinutes: number): string {
@@ -117,16 +117,24 @@ type HeatCellProps = {
   isGoalMet: boolean;
   isSelected: boolean;
   onHover?: (cell: { date: string; value: number } | null) => void;
-  onCellClick?: (date: string, value: number) => void;
+  onCellClick?: (date: string, value: number | undefined) => void;
   /** Fixed pixel size (year view); omit for aspect-square fill. */
   size?: number;
 };
+
+function localToday(): string {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
 
 /** Memoized so a hover only re-renders the cells whose selected state changed. */
 export const HeatCell = memo(function HeatCell({
   date, value, bgColor, fgColor, text, title, isEmpty, isGoalMet, isSelected, onHover, onCellClick, size,
 }: HeatCellProps) {
   const hasValue = value !== undefined;
+  // Any day up to today can be tapped (opens the day's full log); only days
+  // with a value get the hover pop.
+  const clickable = !!onCellClick && date <= localToday();
   // The outer element keeps the un-scaled hit box and owns all mouse events; the
   // inner element does the visual pop with pointer-events-none, so an enlarged
   // tile never steals hover from its neighbors during fast sweeps.
@@ -134,12 +142,12 @@ export const HeatCell = memo(function HeatCell({
     <div
       title={title}
       className={`group relative ${size ? "" : "aspect-square"} ${
-        hasValue ? "cursor-pointer hover:z-30" : "cursor-default"
-      } ${isSelected ? "z-20" : ""}`}
+        clickable ? "cursor-pointer" : "cursor-default"
+      } ${hasValue ? "hover:z-30" : ""} ${isSelected ? "z-20" : ""}`}
       style={{ width: size, height: size }}
       onMouseEnter={() => hasValue && onHover?.({ date, value })}
       onMouseLeave={() => onHover?.(null)}
-      onClick={() => hasValue && onCellClick?.(date, value)}
+      onClick={() => clickable && onCellClick?.(date, value)}
     >
       <div
         className={`pointer-events-none absolute inset-0 flex items-center justify-center font-medium leading-none tabular-nums transition-transform duration-100 ${

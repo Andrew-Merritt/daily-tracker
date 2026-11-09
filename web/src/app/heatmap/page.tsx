@@ -10,6 +10,7 @@ import {
   formatDuration,
 } from "@/components/calendar-heatmap";
 import { YearGrid } from "@/components/year-grid";
+import { DayDetailSheet } from "@/components/day-detail-sheet";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { StatTile, StatTileRow } from "@/components/ui/stat-tile";
@@ -36,6 +37,11 @@ type ConfigRow = {
   metric_name: string;
   type: "number" | "checkbox" | "hhmm" | "time" | "score" | "count" | "text";
   active: boolean;
+  group?: string | null;
+  group_order?: number | null;
+  metric_order?: number | null;
+  private?: boolean;
+  start_date?: string | null;
   analytics_config?: {
     higher_is_better?: boolean;
     direction?: "increase" | "decrease" | "neutral";
@@ -103,6 +109,10 @@ function checkDailyGoal(value: number, goal: DailyGoal, metricType: string): boo
 
 export default function HeatmapPage() {
   const [config, setConfig] = useState<ConfigRow[]>([]);
+  // All active metrics incl. text (notes) — used by the day detail sheet.
+  const [allActive, setAllActive] = useState<ConfigRow[]>([]);
+  const [detailDate, setDetailDate] = useState<string | null>(null);
+  const [detailOpen, setDetailOpen] = useState(false);
   const [logData, setLogData] = useState<LogRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -134,10 +144,13 @@ export default function HeatmapPage() {
 
         if (!cfgRes.ok) throw new Error(cfgData?.error || "Failed to load config");
 
-        // Filter to active non-text metrics
-        const activeMetrics = (cfgData as ConfigRow[]).filter(
-          (m) => m.active && m.type !== "text"
-        );
+        const allActiveMetrics = (cfgData as ConfigRow[])
+          .filter((m) => m.active)
+          .map((m) => ({ ...m, metric_name: (m.metric_name ?? m.metric_id).replace(/\s*\[[0-9a-f]{8}\]$/, "") }));
+        setAllActive(allActiveMetrics);
+
+        // Heatmap selector: active non-text metrics
+        const activeMetrics = allActiveMetrics.filter((m) => m.type !== "text");
         setConfig(activeMetrics);
 
         // Default to first metric if not selected
@@ -343,9 +356,11 @@ export default function HeatmapPage() {
     setHoveredCell(cell);
   }, []);
 
-  // Handle cell click (for mobile - tap to select)
-  const handleCellClick = useCallback((date: string, value: number) => {
-    setHoveredCell({ date, value });
+  // Tap a day: select it and open that day's full log.
+  const handleCellClick = useCallback((date: string, value: number | undefined) => {
+    if (value !== undefined) setHoveredCell({ date, value });
+    setDetailDate(date);
+    setDetailOpen(true);
   }, []);
 
   if (loading) {
@@ -487,7 +502,7 @@ export default function HeatmapPage() {
                     <span className="text-muted-foreground ml-2">{hoveredCell.date}</span>
                   </span>
                 ) : (
-                  <span className="text-muted-foreground">Tap a day to see details</span>
+                  <span className="text-muted-foreground">Tap a day to see everything logged</span>
                 )}
               </div>
               {/* Legend - compact */}
@@ -576,7 +591,7 @@ export default function HeatmapPage() {
               year={selectedYear}
               metricType={metricType}
               direction={direction}
-              selectedDate={hoveredCell?.date}
+              selectedDate={detailOpen ? detailDate : hoveredCell?.date}
               onHover={handleHover}
               onCellClick={handleCellClick}
             />
@@ -586,13 +601,22 @@ export default function HeatmapPage() {
               year={selectedYear}
               metricType={metricType}
               direction={direction}
-              selectedDate={hoveredCell?.date}
+              selectedDate={detailOpen ? detailDate : hoveredCell?.date}
               onHover={handleHover}
               onCellClick={handleCellClick}
             />
           )}
         </CardContent>
       </Card>
+
+      <DayDetailSheet
+        open={detailOpen}
+        onOpenChange={setDetailOpen}
+        date={detailDate}
+        onDateChange={setDetailDate}
+        metrics={allActive}
+        highlightMetricId={selectedMetric}
+      />
     </main>
   );
 }
