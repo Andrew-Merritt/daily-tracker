@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { fetchAllRows } from "@/lib/fetchAllRows";
 import { supabaseServerFromRequest } from "@/lib/supabaseServer";
 import { getLocalDateString, addDays, getServerTimezone } from "@/lib/dateUtils";
 import { calculateAllGoalProgress, Goal, GoalProgress } from "@/lib/goals";
@@ -137,38 +138,23 @@ export async function GET(req: Request) {
   async function loadLogs(metricIds: string[], startDate: string | null) {
     if (metricIds.length === 0) return;
 
-    const logs: LogRow[] = [];
-    const pageSize = 1000;
-    let from = 0;
-    const maxPages = 100; // Higher limit for lifetime metrics
-
-    for (let page = 0; page < maxPages; page++) {
-      let query = supabase
-        .from("log")
-        .select("metric_id, date, value")
-        .eq("owner_id", userId)
-        .in("metric_id", metricIds)
-        .lte("date", referenceDate)
-        .order("date", { ascending: true })
-        .range(from, from + pageSize - 1);
-
-      // Only apply start date filter if provided (not lifetime)
-      if (startDate) {
-        query = query.gte("date", startDate);
-      }
-
-      const { data, error } = await query;
-
-      if (error) {
-        throw new Error(`Failed to load logs: ${error.message}`);
-      }
-
-      const batch = data ?? [];
-      logs.push(...(batch as LogRow[]));
-
-      if (batch.length < pageSize) break;
-      from += pageSize;
-    }
+    // Pages fetched in parallel; metric_id tiebreaker keeps offset paging stable.
+    const logs = await fetchAllRows<LogRow>(
+      (withCount) => {
+        let query = supabase
+          .from("log")
+          .select("metric_id, date, value", withCount ? { count: "exact" } : undefined)
+          .eq("owner_id", userId)
+          .in("metric_id", metricIds)
+          .lte("date", referenceDate)
+          .order("date", { ascending: true })
+          .order("metric_id", { ascending: true });
+        // Only apply start date filter if provided (not lifetime)
+        if (startDate) query = query.gte("date", startDate);
+        return query;
+      },
+      { maxRows: 100_000 }
+    );
 
     for (const row of logs) {
       if (!byMetric.has(row.metric_id)) byMetric.set(row.metric_id, []);

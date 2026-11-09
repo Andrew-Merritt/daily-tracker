@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { fetchAllRows } from "@/lib/fetchAllRows";
 import { supabaseServerFromRequest } from "@/lib/supabaseServer";
 import { getLocalDateString, addDays, compareDates, getServerTimezone } from "@/lib/dateUtils";
 
@@ -106,32 +107,25 @@ export async function GET(req: Request) {
   // This stays small even with huge datasets.
   const reqMetricIds = requiredList.map((m: { metric_id: string }) => m.metric_id);
 
-  const rows: any[] = [];
-  const pageSize = 1000;
-  let from = 0;
-
-  while (true) {
-    const { data, error } = await supabase
-      .from("log")
-      .select("date,metric_id,value,value_text")
-      .eq("owner_id", user.id)
-      .gte("date", minRequiredSince)
-      .lte("date", today)
-      .in("metric_id", reqMetricIds)
-      .order("date", { ascending: true })
-      .range(from, from + pageSize - 1);
-
-    if (error) {
-      return NextResponse.json(
-        { error: "Failed to load required log rows", details: error.message },
-        { status: 500 }
-      );
-    }
-
-    const batch = data ?? [];
-    rows.push(...batch);
-    if (batch.length < pageSize) break;
-    from += pageSize;
+  type HintRow = { date: string; metric_id: string; value: number | null; value_text: string | null };
+  let rows: HintRow[];
+  try {
+    rows = await fetchAllRows<HintRow>((withCount) =>
+      supabase
+        .from("log")
+        .select("date,metric_id,value,value_text", withCount ? { count: "exact" } : undefined)
+        .eq("owner_id", user.id)
+        .gte("date", minRequiredSince)
+        .lte("date", today)
+        .in("metric_id", reqMetricIds)
+        .order("date", { ascending: true })
+        .order("metric_id", { ascending: true })
+    );
+  } catch (e) {
+    return NextResponse.json(
+      { error: "Failed to load required log rows", details: e instanceof Error ? e.message : String(e) },
+      { status: 500 }
+    );
   }
 
   // 5) Build map: date -> set(metric_id present & valid)

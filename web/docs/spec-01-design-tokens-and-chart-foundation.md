@@ -1,7 +1,7 @@
 # Spec 01 — Design Tokens & Chart Foundation
 
 Last updated: 2026-07-17
-Status: ⬜ pending
+Status: ✅ done — Phase A 8fa3d6e, B 8769d00, C 2b66db6, D d14ec01
 Models: Phase A **Haiku 4.5** · Phase B **Sonnet 5** · Phase C **Haiku 4.5** · Phase D **Haiku 4.5** (optional)
 
 Every chart in the app currently hardcodes its own hex colors

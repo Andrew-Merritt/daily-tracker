@@ -1,6 +1,6 @@
 # Visual & UX Upgrade Roadmap — July 2026
 
-Last updated: 2026-07-17
+Last updated: 2026-11-09
 Status key: ✅ done · 🔄 in progress · ⬜ pending
 
 Master plan for the visual/UX overhaul, prioritized around the two daily-use
@@ -14,24 +14,24 @@ time, in one session each.
 
 Run the specs in this order. Do not start a spec until its dependencies are ✅.
 
-| # | Spec | Doc | Model | Depends on |
-|---|------|-----|-------|------------|
-| 1a | Design tokens in globals.css | `spec-01-design-tokens-and-chart-foundation.md` Phase A | **Haiku 4.5** | — |
-| 1b | `<TrackerChart>` + `<StatTile>` components | spec-01 Phase B | **Sonnet 5** | 1a |
-| 1c | Hardcoded-hex sweep | spec-01 Phase C | **Haiku 4.5** | 1a |
-| 1d | Typeface (optional) | spec-01 Phase D | **Haiku 4.5** | — |
-| 2 | Heatmap redesign | `spec-02-heatmap-redesign.md` | **Sonnet 5** | 1a |
-| 3a | Metric stats sheet re-skin | `spec-03-tracker-subpage-reskins.md` § A | **Sonnet 5** | 1b |
-| 3b | /metrics page re-skin | spec-03 § B | **Haiku 4.5** | 1b, 3a |
-| 3c | /summary sparklines | spec-03 § C | **Sonnet 5** | 1b |
-| 3d | Retire /ma | spec-03 § D | **Haiku 4.5** | 3a |
-| 4a | ExerciseStatsSheet re-skin | `spec-04-workout-module-upgrades.md` § A | **Sonnet 5** | 1b |
-| 4b | Estimated 1RM progression | spec-04 § B | **Sonnet 5** | 4a |
-| 4c | Weekly volume dashboard | spec-04 § C | **Sonnet 5** | 1b |
-| 4d | Workout consistency heatmap | spec-04 § D | **Haiku 4.5** | 2, 5 |
-| 5 | Workout → tracker system metrics | `spec-05-workout-system-metrics.md` | **Opus 4.8** (do not use a smaller model) | — |
-| 6a | SWR reference migration | `spec-06-swr-data-layer.md` § A | **Sonnet 5** | — |
-| 6b | SWR page-by-page conversion | spec-06 § B | **Haiku 4.5** | 6a |
+| # | Spec | Doc | Model | Depends on | Status |
+|---|------|-----|-------|------------|--------|
+| 1a | Design tokens in globals.css | `spec-01-design-tokens-and-chart-foundation.md` Phase A | **Haiku 4.5** | — | ✅ (8fa3d6e) |
+| 1b | `<TrackerChart>` + `<StatTile>` components | spec-01 Phase B | **Sonnet 5** | 1a | ✅ (8769d00) |
+| 1c | Hardcoded-hex sweep | spec-01 Phase C | **Haiku 4.5** | 1a | ✅ (2b66db6) |
+| 1d | Typeface (optional) | spec-01 Phase D | **Haiku 4.5** | — | ✅ (d14ec01) |
+| 2 | Heatmap redesign | `spec-02-heatmap-redesign.md` | **Sonnet 5** | 1a | ✅ (333e945, 0b59e98, 6ad5c9a) |
+| 3a | Metric stats sheet re-skin | `spec-03-tracker-subpage-reskins.md` § A | **Sonnet 5** | 1b | ⬜ |
+| 3b | /metrics page re-skin | spec-03 § B | **Haiku 4.5** | 1b, 3a | ⬜ |
+| 3c | /summary sparklines | spec-03 § C | **Sonnet 5** | 1b | ⬜ |
+| 3d | Retire /ma | spec-03 § D | **Haiku 4.5** | 3a | ⬜ |
+| 4a | ExerciseStatsSheet re-skin | `spec-04-workout-module-upgrades.md` § A | **Sonnet 5** | 1b | ⬜ |
+| 4b | Estimated 1RM progression | spec-04 § B | **Sonnet 5** | 4a | ⬜ |
+| 4c | Weekly volume dashboard | spec-04 § C | **Sonnet 5** | 1b | ⬜ |
+| 4d | Workout consistency heatmap | spec-04 § D | **Haiku 4.5** | 2, 5 | ⬜ |
+| 5 | Workout → tracker system metrics | `spec-05-workout-system-metrics.md` | **Opus 4.8** (do not use a smaller model) | — | ⬜ |
+| 6a | SWR reference migration | `spec-06-swr-data-layer.md` § A | **Sonnet 5** | — | ⬜ |
+| 6b | SWR page-by-page conversion | spec-06 § B | **Haiku 4.5** | 6a | ⬜ |
 
 ### Why these assignments
 
@@ -81,4 +81,4 @@ Run the specs in this order. Do not start a spec until its dependencies are ✅.
 - Food/books system metrics (same pattern as spec-05)
 - Custom insights out of localStorage into DB
 - Weekly AI digest email
-- Web app manifest for Android installability (quick win — 2 files, Haiku)
+- ~~Web app manifest for Android installability~~ ✅ done (`src/app/manifest.ts`, with app shortcuts)

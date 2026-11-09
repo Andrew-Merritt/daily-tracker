@@ -6,6 +6,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { useTheme } from "@/components/theme-provider";
+import { CALC_DEBUG_KEY } from "@/lib/devFlags";
 
 type MainPageSettings = {
   show_indicators: boolean;
@@ -64,6 +65,17 @@ export default function SettingsPage() {
   // Profile state
   const [profile, setProfile] = useState<UserProfile>({ gender: null, birth_year: null });
   const [profileLoading, setProfileLoading] = useState(true);
+
+  // Per-device developer toggle: shows formula/debug info under calculated metrics on the Today page
+  const [calcDebug, setCalcDebug] = useState(false);
+  useEffect(() => {
+    setCalcDebug(localStorage.getItem(CALC_DEBUG_KEY) === "1");
+  }, []);
+  const toggleCalcDebug = (on: boolean) => {
+    setCalcDebug(on);
+    if (on) localStorage.setItem(CALC_DEBUG_KEY, "1");
+    else localStorage.removeItem(CALC_DEBUG_KEY);
+  };
   const [profileSaving, setProfileSaving] = useState(false);
   const [profileSaveStatus, setProfileSaveStatus] = useState<string | null>(null);
   const [birthYearInput, setBirthYearInput] = useState("");
@@ -482,6 +494,17 @@ export default function SettingsPage() {
             Recalculate computed metrics (like those using <code className="bg-muted px-1 rounded">prev()</code> or <code className="bg-muted px-1 rounded">diff()</code>).
             Use this after changing formulas or if calculated values seem incorrect.
           </p>
+
+          <label className="flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={calcDebug}
+              onChange={(e) => toggleCalcDebug(e.target.checked)}
+              className="h-4 w-4 rounded"
+            />
+            Show calc debug on the Today page
+            <span className="text-xs text-muted-foreground">(this device only)</span>
+          </label>
 
           {/* Full backfill */}
           <div className="flex items-center gap-3">

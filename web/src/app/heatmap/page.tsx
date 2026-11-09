@@ -1,25 +1,34 @@
 "use client";
 
-import { useEffect, useState, useMemo, useCallback } from "react";
+import { useEffect, useState, useMemo, useCallback, useRef } from "react";
+import { ChevronLeft, ChevronRight } from "lucide-react";
 import { getAuthHeaders } from "@/lib/authHeaders";
-import {
-  CalendarHeatmap,
-  HeatmapDataPoint,
-  getHeatmapLegendColors,
-  formatHHMM,
-  formatDuration,
-} from "@/components/calendar-heatmap";
+import { CalendarHeatmap } from "@/components/calendar-heatmap";
 import { YearGrid } from "@/components/year-grid";
+import { WeekGrid } from "@/components/week-grid";
+import { HeatmapPatterns } from "@/components/heatmap-patterns";
+import { DayDetailSheet } from "@/components/day-detail-sheet";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { StatTile, StatTileRow } from "@/components/ui/stat-tile";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
+  buildOverlay,
+  buildPeriods,
+  compareOverlay,
+  eachDate,
+  formatCellValue,
+  formatShortDate,
+  LEGEND_COLORS,
+  makeBucketer,
+  ROLLING_KEY,
+  shiftDate,
+  sortMetricsForDisplay,
+  type HeatScale,
+  type HeatmapDataPoint,
+  type HeatmapDirection,
+  type HeatmapMetricType,
+} from "@/lib/heatmap";
 
 type DailyGoal = {
   type: "numeric" | "numeric_threshold" | "checkbox" | "hhmm_target";
@@ -34,11 +43,16 @@ type DailyGoal = {
 type ConfigRow = {
   metric_id: string;
   metric_name: string;
-  type: "number" | "checkbox" | "hhmm" | "time" | "score" | "count" | "text";
+  type: HeatmapMetricType;
   active: boolean;
+  group?: string | null;
+  group_order?: number | null;
+  metric_order?: number | null;
+  private?: boolean;
+  start_date?: string | null;
   analytics_config?: {
     higher_is_better?: boolean;
-    direction?: "increase" | "decrease" | "neutral";
+    direction?: HeatmapDirection;
   } | null;
   goals_config?: {
     goals?: Array<{
@@ -57,69 +71,119 @@ type ConfigRow = {
   } | null;
 };
 
-type LogRow = {
-  date: string;
-  metric_id: string;
-  value: number | null;
+type LogRow = { date: string; metric_id: string; value: number | null };
+type View = "weeks" | "months" | "year";
+
+const NO_OVERLAY = "__none__";
+const LS = {
+  view: "heatmap:view",
+  metric: "heatmap:metric",
+  period: "heatmap:period",
+  scale: "heatmap:scale",
+  overlay: "heatmap:overlay",
+  overlayLag: "heatmap:overlayLag",
 };
 
-function formatValue(value: number, type: string): string {
-  switch (type) {
-    case "hhmm":
-      return formatHHMM(value);
-    case "time":
-      return formatDuration(value);
-    case "checkbox":
-      return value >= 0.5 ? "Yes" : "No";
-    default:
-      return String(Math.round(value * 100) / 100);
-  }
-}
-
 // Check if a value meets a daily goal
-function checkDailyGoal(value: number, goal: DailyGoal, metricType: string): boolean {
+function checkDailyGoal(value: number, goal: DailyGoal): boolean {
   switch (goal.type) {
     case "numeric":
-      if (goal.direction === "lte") {
-        return value <= (goal.target ?? 0);
-      }
-      return value >= (goal.target ?? 0);
+      return goal.direction === "lte" ? value <= (goal.target ?? 0) : value >= (goal.target ?? 0);
     case "numeric_threshold":
-      if (goal.direction === "lte") {
-        return value <= (goal.threshold ?? 0);
-      }
-      return value >= (goal.threshold ?? 0);
+      return goal.direction === "lte" ? value <= (goal.threshold ?? 0) : value >= (goal.threshold ?? 0);
     case "checkbox":
       return value >= 0.5;
     case "hhmm_target":
-      if (goal.direction === "before") {
-        return value <= (goal.target_time ?? 0);
-      }
-      return value >= (goal.target_time ?? 0);
+      return goal.direction === "before" ? value <= (goal.target_time ?? 0) : value >= (goal.target_time ?? 0);
     default:
       return false;
   }
 }
 
+function metricDirection(c: ConfigRow | undefined): HeatmapDirection {
+  if (c?.analytics_config?.direction) return c.analytics_config.direction;
+  // Backwards compat: higher_is_better false means decrease
+  if (c?.analytics_config?.higher_is_better === false) return "decrease";
+  return "increase";
+}
+
+function fmtAvg(v: number, metricType: HeatmapMetricType): string {
+  if (metricType === "checkbox") return `${Math.round(v * 100)}%`;
+  return formatCellValue(v, metricType);
+}
+
+/** Small segmented control. */
+function Segmented<T extends string>({
+  value,
+  options,
+  onChange,
+}: {
+  value: T;
+  options: { value: T; label: string }[];
+  onChange: (v: T) => void;
+}) {
+  return (
+    <div className="inline-flex items-center gap-0.5 border rounded-md p-0.5">
+      {options.map((o) => (
+        <Button
+          key={o.value}
+          variant={value === o.value ? "default" : "ghost"}
+          size="sm"
+          className="h-7 px-2"
+          onClick={() => onChange(o.value)}
+        >
+          {o.label}
+        </Button>
+      ))}
+    </div>
+  );
+}
+
 export default function HeatmapPage() {
   const [config, setConfig] = useState<ConfigRow[]>([]);
-  const [logData, setLogData] = useState<LogRow[]>([]);
+  // All active metrics incl. text (notes) — used by the day detail sheet.
+  const [allActive, setAllActive] = useState<ConfigRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   const [selectedMetric, setSelectedMetric] = useState<string | null>(null);
-  const [selectedYear, setSelectedYear] = useState<number>(new Date().getFullYear());
+  const [periodKey, setPeriodKey] = useState<string>(ROLLING_KEY);
+  const [view, setView] = useState<View>("months");
+  const [scale, setScale] = useState<HeatScale>("percentile");
+  const [overlayMetric, setOverlayMetric] = useState<string>(NO_OVERLAY);
+  // "next": dot lands on the day AFTER the overlay event (e.g. sleep the night after drinking).
+  const [overlayLag, setOverlayLag] = useState<"same" | "next">("same");
   const [hoveredCell, setHoveredCell] = useState<{ date: string; value: number } | null>(null);
-  const [view, setView] = useState<"months" | "year">("months");
+  const [detailDate, setDetailDate] = useState<string | null>(null);
+  const [detailOpen, setDetailOpen] = useState(false);
 
+  // Restore per-device preferences. Phones default to the Weeks view.
   useEffect(() => {
-    const stored = localStorage.getItem("heatmap:view");
-    if (stored === "months" || stored === "year") setView(stored);
+    const v = localStorage.getItem(LS.view);
+    if (v === "weeks" || v === "months" || v === "year") setView(v);
+    else if (window.matchMedia("(max-width: 639px)").matches) setView("weeks");
+    const s = localStorage.getItem(LS.scale);
+    if (s === "percentile" || s === "range") setScale(s);
+    const p = localStorage.getItem(LS.period);
+    if (p) setPeriodKey(p);
+    const o = localStorage.getItem(LS.overlay);
+    if (o) setOverlayMetric(o);
+    if (localStorage.getItem(LS.overlayLag) === "next") setOverlayLag("next");
   }, []);
 
-  const handleViewChange = useCallback((next: "months" | "year") => {
-    setView(next);
-    localStorage.setItem("heatmap:view", next);
+  const persist = <T extends string>(key: string, set: (v: T) => void) => (v: T) => {
+    set(v);
+    localStorage.setItem(key, v);
+  };
+  const changeView = persist<View>(LS.view, setView);
+  const changeScale = persist<HeatScale>(LS.scale, setScale);
+  const changePeriod = persist<string>(LS.period, setPeriodKey);
+  const changeOverlay = persist<string>(LS.overlay, setOverlayMetric);
+  const changeOverlayLag = persist<"same" | "next">(LS.overlayLag, setOverlayLag);
+  const changeMetric = useCallback((id: string) => {
+    setSelectedMetric(id);
+    setHoveredCell(null);
+    localStorage.setItem(LS.metric, id);
   }, []);
 
   // Load config on mount
@@ -128,22 +192,24 @@ export default function HeatmapPage() {
       try {
         setLoading(true);
         const headers = await getAuthHeaders();
-
         const cfgRes = await fetch("/api/config", { headers });
         const cfgData = await cfgRes.json();
-
         if (!cfgRes.ok) throw new Error(cfgData?.error || "Failed to load config");
 
-        // Filter to active non-text metrics
-        const activeMetrics = (cfgData as ConfigRow[]).filter(
-          (m) => m.active && m.type !== "text"
+        const allActiveMetrics = sortMetricsForDisplay(
+          (cfgData as ConfigRow[])
+            .filter((m) => m.active)
+            .map((m) => ({ ...m, metric_name: (m.metric_name ?? m.metric_id).replace(/\s*\[[0-9a-f]{8}\]$/, "") }))
         );
+        setAllActive(allActiveMetrics);
+
+        // Heatmap selector: active non-text metrics
+        const activeMetrics = allActiveMetrics.filter((m) => m.type !== "text");
         setConfig(activeMetrics);
 
-        // Default to first metric if not selected
-        if (activeMetrics.length > 0 && !selectedMetric) {
-          setSelectedMetric(activeMetrics[0].metric_id);
-        }
+        const stored = localStorage.getItem(LS.metric);
+        const initial = activeMetrics.find((m) => m.metric_id === stored) ?? activeMetrics[0];
+        if (initial) setSelectedMetric(initial.metric_id);
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e));
       } finally {
@@ -152,47 +218,81 @@ export default function HeatmapPage() {
     })();
   }, []);
 
-  // Load log data for selected year (with year filter for performance)
+  // Years that actually have data (newest first). Falls back to the last 6 years.
+  const [availableYears, setAvailableYears] = useState<number[]>(() => {
+    const currentYear = new Date().getFullYear();
+    return Array.from({ length: 6 }, (_, i) => currentYear - i);
+  });
   useEffect(() => {
-    if (!selectedMetric) return;
-
     (async () => {
       try {
         const headers = await getAuthHeaders();
-        const logRes = await fetch(`/api/log?year=${selectedYear}`, { headers });
-        const logDataRes = await logRes.json();
-
-        if (!logRes.ok) throw new Error(logDataRes?.error || "Failed to load logs");
-        setLogData(logDataRes);
-      } catch (e) {
-        setError(e instanceof Error ? e.message : String(e));
+        const res = await fetch("/api/log?years=1", { headers });
+        if (!res.ok) return;
+        const years = (await res.json()) as number[];
+        if (Array.isArray(years) && years.length > 0) setAvailableYears(years);
+      } catch {
+        // keep fallback
       }
     })();
-  }, [selectedYear, selectedMetric]);
-
-  // Available years - show current year and previous 5 years
-  const availableYears = useMemo(() => {
-    const currentYear = new Date().getFullYear();
-    const years: number[] = [];
-    for (let y = currentYear; y >= currentYear - 5; y--) {
-      years.push(y);
-    }
-    return years;
   }, []);
 
-  // Get selected metric config
-  const selectedConfig = useMemo(() => {
-    return config.find((c) => c.metric_id === selectedMetric);
-  }, [config, selectedMetric]);
+  const periods = useMemo(() => buildPeriods(availableYears), [availableYears]);
+  const period = periods.find((p) => p.key === periodKey) ?? periods[0];
+  const periodIdx = periods.indexOf(period);
 
-  // Get daily goal for selected metric (if any)
+  // ---------------------------------------------------------------------------
+  // Data: one metric over one period, cached by key for the life of the page.
+  // ---------------------------------------------------------------------------
+  const [rangeData, setRangeData] = useState<Record<string, LogRow[]>>({});
+  const inFlight = useRef(new Set<string>());
+  const ensureLoaded = useCallback(
+    (metricId: string | null) => {
+      if (!metricId) return;
+      const key = `${metricId}|${period.start}|${period.end}`;
+      if (rangeData[key] || inFlight.current.has(key)) return;
+      inFlight.current.add(key);
+      (async () => {
+        try {
+          const headers = await getAuthHeaders();
+          const params = new URLSearchParams({ metric_id: metricId, start: period.start, end: period.end });
+          const res = await fetch(`/api/log?${params}`, { headers });
+          const json = await res.json();
+          if (!res.ok) throw new Error(json?.error || "Failed to load logs");
+          setRangeData((prev) => ({ ...prev, [key]: json as LogRow[] }));
+        } catch (e) {
+          setError(e instanceof Error ? e.message : String(e));
+        } finally {
+          inFlight.current.delete(key);
+        }
+      })();
+    },
+    [period.start, period.end, rangeData]
+  );
+  const rowsFor = (metricId: string | null) =>
+    metricId ? rangeData[`${metricId}|${period.start}|${period.end}`] : undefined;
+
+  const overlayId = overlayMetric !== NO_OVERLAY && overlayMetric !== selectedMetric ? overlayMetric : null;
+  useEffect(() => {
+    ensureLoaded(selectedMetric);
+    ensureLoaded(overlayId);
+  }, [ensureLoaded, selectedMetric, overlayId]);
+
+  const primaryRows = rowsFor(selectedMetric);
+  const overlayRows = rowsFor(overlayId);
+  const dataLoading = !!selectedMetric && !primaryRows;
+
+  // ---------------------------------------------------------------------------
+  // Derived
+  // ---------------------------------------------------------------------------
+  const selectedConfig = config.find((c) => c.metric_id === selectedMetric);
+  const overlayConfig = config.find((c) => c.metric_id === overlayId);
+  const metricType: HeatmapMetricType = selectedConfig?.type || "number";
+  const direction = metricDirection(selectedConfig);
+
   const dailyGoal = useMemo((): DailyGoal | null => {
-    const goals = selectedConfig?.goals_config?.goals;
-    if (!goals) return null;
-
-    const daily = goals.find((g) => g.frequency === "daily" && g.enabled);
+    const daily = selectedConfig?.goals_config?.goals?.find((g) => g.frequency === "daily" && g.enabled);
     if (!daily) return null;
-
     return {
       type: daily.type as DailyGoal["type"],
       target: daily.target,
@@ -204,168 +304,165 @@ export default function HeatmapPage() {
     };
   }, [selectedConfig]);
 
-  // Prepare heatmap data for selected metric with goal achievement info
   const heatmapData = useMemo((): HeatmapDataPoint[] => {
-    if (!selectedMetric) return [];
-    const metricType = selectedConfig?.type || "number";
-
-    return logData
-      .filter((l) => l.metric_id === selectedMetric && l.value != null)
+    return (primaryRows ?? [])
+      .filter((l) => l.value != null)
       .map((l) => ({
         date: l.date,
         value: l.value!,
-        goalMet: dailyGoal ? checkDailyGoal(l.value!, dailyGoal, metricType) : undefined,
+        goalMet: dailyGoal ? checkDailyGoal(l.value!, dailyGoal) : undefined,
       }));
-  }, [logData, selectedMetric, selectedConfig, dailyGoal]);
+  }, [primaryRows, dailyGoal]);
 
-  // Determine direction (default to "increase" for backwards compat)
-  const direction = useMemo((): "increase" | "decrease" | "neutral" => {
-    if (selectedConfig?.analytics_config?.direction) {
-      return selectedConfig.analytics_config.direction;
-    }
-    // Backwards compat: higher_is_better false means decrease
-    if (selectedConfig?.analytics_config?.higher_is_better === false) {
-      return "decrease";
-    }
-    return "increase";
-  }, [selectedConfig]);
+  const bucketOf = useMemo(
+    () => makeBucketer(heatmapData.map((d) => d.value), scale),
+    [heatmapData, scale]
+  );
 
-  const metricType = selectedConfig?.type || "number";
+  // Days the metric could have been logged in this period (from its start_date).
+  const trackedDates = useMemo(() => {
+    const since = selectedConfig?.start_date;
+    const from = since && since > period.start ? since : period.start;
+    return from <= period.end ? eachDate(from, period.end) : [];
+  }, [selectedConfig, period.start, period.end]);
 
-  // Stats for selected year
-  const yearStats = useMemo(() => {
-    const yearStr = String(selectedYear);
-    const yearData = heatmapData.filter((d) => d.date.startsWith(yearStr));
-    if (yearData.length === 0) return null;
-
-    const values = yearData.map((d) => d.value);
-    const sum = values.reduce((a, b) => a + b, 0);
-    const avg = sum / values.length;
-    const min = Math.min(...values);
-    const max = Math.max(...values);
-    const goalMetCount = yearData.filter((d) => d.goalMet).length;
-
+  const overlay = useMemo(() => {
+    if (!overlayConfig || !overlayRows) return null;
+    const pts = overlayRows.filter((r) => r.value != null).map((r) => ({ date: r.date, value: r.value! }));
+    const base = buildOverlay(pts, overlayConfig.metric_name, overlayConfig.type);
+    if (overlayLag === "same") return base;
     return {
-      count: yearData.length,
-      sum,
-      avg,
-      min,
-      max,
-      goalMetCount,
+      dates: new Set([...base.dates].map((d) => shiftDate(d, 1))),
+      label: `Day after: ${base.label}`,
     };
-  }, [heatmapData, selectedYear]);
+  }, [overlayConfig, overlayRows, overlayLag]);
 
-  // Legend colors
-  const legendColors = useMemo(() => {
-    if (!yearStats || metricType === "checkbox") return null;
-    return getHeatmapLegendColors(direction);
-  }, [yearStats, direction, metricType]);
+  const overlayCompare = useMemo(
+    () => (overlay ? compareOverlay(heatmapData, overlay, metricType, trackedDates) : null),
+    [overlay, heatmapData, metricType, trackedDates]
+  );
 
-  // Header stat tiles: days logged, current streak, longest streak, goal met %
-  const headerStats = useMemo(() => {
-    if (!yearStats) return null;
-    const dateSet = new Set(heatmapData.filter((d) => d.date.startsWith(String(selectedYear))).map((d) => d.date));
-    const sortedDates = [...dateSet].sort();
-
-    const toDateStr = (d: Date) =>
-      `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  const stats = useMemo(() => {
+    if (heatmapData.length === 0) return null;
+    const values = heatmapData.map((d) => d.value);
+    const sum = values.reduce((a, b) => a + b, 0);
+    // For checkboxes only checked days count as "logged" (unchecked has no row).
+    const loggedDates = new Set(
+      heatmapData.filter((d) => metricType !== "checkbox" || d.value >= 0.5).map((d) => d.date)
+    );
+    const sorted = [...loggedDates].sort();
 
     let longest = 0;
     let run = 0;
-    let prevDate: string | null = null;
-    for (const d of sortedDates) {
-      if (prevDate) {
-        const diffDays = Math.round(
-          (new Date(`${d}T00:00:00`).getTime() - new Date(`${prevDate}T00:00:00`).getTime()) / 86400000
-        );
-        run = diffDays === 1 ? run + 1 : 1;
-      } else {
-        run = 1;
-      }
+    let prev: string | null = null;
+    for (const d of sorted) {
+      run = prev && shiftDate(prev, 1) === d ? run + 1 : 1;
       longest = Math.max(longest, run);
-      prevDate = d;
+      prev = d;
     }
-
-    const now = new Date();
-    const isCurrentYear = selectedYear === now.getFullYear();
-    const cur = isCurrentYear ? new Date(now) : new Date(selectedYear, 11, 31);
-    if (!dateSet.has(toDateStr(cur))) cur.setDate(cur.getDate() - 1);
+    // Current streak counts back from the period's end (today, for current periods),
+    // allowing today to still be unlogged.
+    let cur = period.end;
+    if (!loggedDates.has(cur)) cur = shiftDate(cur, -1);
     let current = 0;
-    while (dateSet.has(toDateStr(cur))) {
+    while (loggedDates.has(cur)) {
       current++;
-      cur.setDate(cur.getDate() - 1);
+      cur = shiftDate(cur, -1);
     }
 
-    const isLeap = (y: number) => (y % 4 === 0 && y % 100 !== 0) || y % 400 === 0;
-    const elapsed = isCurrentYear
-      ? Math.floor((now.getTime() - new Date(selectedYear, 0, 1).getTime()) / 86400000) + 1
-      : isLeap(selectedYear)
-      ? 366
-      : 365;
-
-    const goalMetPct =
-      dailyGoal && dateSet.size > 0 ? Math.round((yearStats.goalMetCount / dateSet.size) * 100) : null;
-
+    const goalMetCount = heatmapData.filter((d) => d.goalMet).length;
     return {
-      loggedText: `${dateSet.size}/${elapsed}`,
+      count: loggedDates.size,
+      possible: trackedDates.length,
+      sum,
+      avg: sum / values.length,
+      min: Math.min(...values),
+      max: Math.max(...values),
       longest,
       current,
-      goalMetPct,
+      goalMetCount,
+      goalMetPct: dailyGoal && loggedDates.size > 0 ? Math.round((goalMetCount / loggedDates.size) * 100) : null,
     };
-  }, [heatmapData, selectedYear, yearStats, dailyGoal]);
+  }, [heatmapData, metricType, period.end, trackedDates, dailyGoal]);
 
-  const handleHover = useCallback((cell: { date: string; value: number } | null) => {
-    setHoveredCell(cell);
+  // ---------------------------------------------------------------------------
+  // Interaction
+  // ---------------------------------------------------------------------------
+  const handleHover = useCallback((cell: { date: string; value: number } | null) => setHoveredCell(cell), []);
+
+  // Tap a day: select it and open that day's full log.
+  const handleCellClick = useCallback((date: string, value: number | undefined) => {
+    if (value !== undefined) setHoveredCell({ date, value });
+    setDetailDate(date);
+    setDetailOpen(true);
   }, []);
 
-  // Handle cell click (for mobile - tap to select)
-  const handleCellClick = useCallback((date: string, value: number) => {
-    setHoveredCell({ date, value });
-  }, []);
+  const metricIdx = config.findIndex((c) => c.metric_id === selectedMetric);
+  const stepMetric = (delta: number) => {
+    if (config.length === 0) return;
+    const next = config[(metricIdx + delta + config.length) % config.length];
+    changeMetric(next.metric_id);
+  };
 
-  if (loading) {
+  // Swipe left/right on the heatmap to change metric (not in Year view, which
+  // scrolls horizontally).
+  const touchStart = useRef<{ x: number; y: number } | null>(null);
+  const onTouchStart = (e: React.TouchEvent) => {
+    touchStart.current = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+  };
+  const onTouchEnd = (e: React.TouchEvent) => {
+    const s = touchStart.current;
+    touchStart.current = null;
+    if (!s || view === "year") return;
+    const dx = e.changedTouches[0].clientX - s.x;
+    const dy = e.changedTouches[0].clientY - s.y;
+    if (Math.abs(dx) < 70 || Math.abs(dx) < Math.abs(dy) * 1.5) return;
+    stepMetric(dx < 0 ? 1 : -1);
+  };
+
+  // ---------------------------------------------------------------------------
+  // Render
+  // ---------------------------------------------------------------------------
+  if (loading || error || config.length === 0) {
     return (
       <main className="p-6 max-w-6xl mx-auto">
-        <h1 className="text-2xl font-semibold mb-4">Calendar Heatmap</h1>
-        <div className="text-sm text-muted-foreground">Loading...</div>
+        <h1 className="text-2xl font-semibold mb-4">Heatmap</h1>
+        <div className={`text-sm ${error ? "text-red-600" : "text-muted-foreground"}`}>
+          {error ? `Error: ${error}` : loading ? "Loading..." : "No metrics available."}
+        </div>
       </main>
     );
   }
 
-  if (error) {
-    return (
-      <main className="p-6 max-w-6xl mx-auto">
-        <h1 className="text-2xl font-semibold mb-4">Calendar Heatmap</h1>
-        <div className="text-sm text-red-600">Error: {error}</div>
-      </main>
-    );
-  }
-
-  if (config.length === 0) {
-    return (
-      <main className="p-6 max-w-6xl mx-auto">
-        <h1 className="text-2xl font-semibold mb-4">Calendar Heatmap</h1>
-        <div className="text-sm text-muted-foreground">No metrics available.</div>
-      </main>
-    );
-  }
-
-  // Determine which stats to show based on type
   const showTotal = metricType !== "hhmm" && metricType !== "checkbox";
-  const showAvg = metricType !== "checkbox";
-  const showMinMax = metricType !== "checkbox";
+  const isNumeric = metricType !== "checkbox";
+  const selectedDate = detailOpen ? detailDate : hoveredCell?.date;
+  const gridProps = {
+    data: heatmapData,
+    start: period.start,
+    end: period.end,
+    metricType,
+    direction,
+    bucketOf,
+    selectedDate,
+    markers: overlay?.dates ?? null,
+    onHover: handleHover,
+    onCellClick: handleCellClick,
+  };
 
   return (
     <main className="px-3 sm:px-6 py-4 sm:py-6 max-w-6xl mx-auto space-y-4 overflow-x-hidden">
-      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
-        <h1 className="text-xl sm:text-2xl font-semibold">Calendar Heatmap</h1>
+      {/* Controls */}
+      <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
+        <h1 className="text-xl sm:text-2xl font-semibold">Heatmap</h1>
 
-        <div className="flex flex-wrap items-center gap-2 sm:gap-4">
-          {/* Metric selector */}
-          <div className="flex items-center gap-2">
-            <label className="text-sm text-muted-foreground hidden sm:inline">Metric:</label>
-            <Select value={selectedMetric ?? ""} onValueChange={setSelectedMetric}>
-              <SelectTrigger className="w-[140px] sm:w-[180px]">
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="flex items-center gap-1 flex-1 min-w-0 sm:flex-none">
+            <Button variant="outline" size="sm" className="h-9 w-9 p-0 shrink-0" onClick={() => stepMetric(-1)} aria-label="Previous metric">
+              <ChevronLeft className="h-4 w-4" />
+            </Button>
+            <Select value={selectedMetric ?? ""} onValueChange={changeMetric}>
+              <SelectTrigger className="flex-1 min-w-0 sm:w-[200px]">
                 <SelectValue placeholder="Select metric" />
               </SelectTrigger>
               <SelectContent>
@@ -376,198 +473,255 @@ export default function HeatmapPage() {
                 ))}
               </SelectContent>
             </Select>
-          </div>
-
-          {/* Year selector */}
-          <div className="flex items-center gap-1">
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => setSelectedYear((y) => y - 1)}
-              disabled={selectedYear <= 2015}
-            >
-              &lt;
-            </Button>
-            <Select
-              value={String(selectedYear)}
-              onValueChange={(v) => setSelectedYear(parseInt(v, 10))}
-            >
-              <SelectTrigger className="w-[80px]">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {availableYears.map((year) => (
-                  <SelectItem key={year} value={String(year)}>
-                    {year}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => setSelectedYear((y) => y + 1)}
-              disabled={selectedYear >= new Date().getFullYear()}
-            >
-              &gt;
+            <Button variant="outline" size="sm" className="h-9 w-9 p-0 shrink-0" onClick={() => stepMetric(1)} aria-label="Next metric">
+              <ChevronRight className="h-4 w-4" />
             </Button>
           </div>
 
-          {/* View toggle */}
-          <div className="flex items-center gap-1 border rounded-md p-0.5">
-            <Button
-              variant={view === "months" ? "default" : "ghost"}
-              size="sm"
-              className="h-7 px-2"
-              onClick={() => handleViewChange("months")}
-            >
-              Months
-            </Button>
-            <Button
-              variant={view === "year" ? "default" : "ghost"}
-              size="sm"
-              className="h-7 px-2"
-              onClick={() => handleViewChange("year")}
-            >
-              Year
-            </Button>
+          <div className="flex items-center gap-2 w-full sm:w-auto">
+            <div className="flex items-center gap-1 flex-1 sm:flex-none">
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-9 w-9 p-0"
+                onClick={() => changePeriod(periods[periodIdx + 1].key)}
+                disabled={periodIdx >= periods.length - 1}
+                aria-label="Earlier period"
+              >
+                <ChevronLeft className="h-4 w-4" />
+              </Button>
+              <Select value={period.key} onValueChange={changePeriod}>
+                <SelectTrigger className="flex-1 sm:w-[160px]">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {periods.map((p) => (
+                    <SelectItem key={p.key} value={p.key}>
+                      {p.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-9 w-9 p-0"
+                onClick={() => changePeriod(periods[periodIdx - 1].key)}
+                disabled={periodIdx <= 0}
+                aria-label="Later period"
+              >
+                <ChevronRight className="h-4 w-4" />
+              </Button>
+            </div>
           </div>
         </div>
       </div>
 
       {/* Header stat tiles */}
-      {headerStats && (
+      {stats && (
         <StatTileRow>
-          <StatTile label="Days logged" value={headerStats.loggedText} />
-          <StatTile label="Current streak" value={`${headerStats.current} days`} />
-          <StatTile label="Longest streak" value={`${headerStats.longest} days`} />
-          {headerStats.goalMetPct !== null && (
-            <StatTile label="Goal met" value={`${headerStats.goalMetPct}%`} />
-          )}
+          <StatTile label={metricType === "checkbox" ? "Days done" : "Days logged"} value={`${stats.count}/${stats.possible}`} />
+          <StatTile label="Current streak" value={`${stats.current} days`} />
+          <StatTile label="Longest streak" value={`${stats.longest} days`} />
+          {stats.goalMetPct !== null && <StatTile label="Goal met" value={`${stats.goalMetPct}%`} />}
         </StatTileRow>
       )}
 
-      {/* Stats card with legend and tap info */}
+      {/* Info card: selection, legend, stats, color + overlay options */}
       <Card>
-        <CardContent className="py-3 px-3 sm:px-6">
-          <div className="flex flex-col gap-3">
-            {/* Top row: Selected day info */}
-            <div className="flex items-center justify-between min-h-8">
-              <div className="text-sm whitespace-nowrap">
-                {hoveredCell ? (
-                  <span>
-                    <span className="font-mono font-medium">
-                      {formatValue(hoveredCell.value, metricType)}
-                    </span>
-                    <span className="text-muted-foreground ml-2">{hoveredCell.date}</span>
-                  </span>
-                ) : (
-                  <span className="text-muted-foreground">Tap a day to see details</span>
-                )}
-              </div>
-              {/* Legend - compact */}
-              {legendColors && (
-                <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-                  <span className="hidden sm:inline">{direction === "neutral" ? "less" : "worse"}</span>
-                  <div className="flex gap-0.5">
-                    {legendColors.map((color, idx) => (
-                      <div
-                        key={idx}
-                        className="w-3 h-3 sm:w-4 sm:h-4 rounded-sm"
-                        style={{ backgroundColor: color }}
-                      />
-                    ))}
-                  </div>
-                  <span className="hidden sm:inline">{direction === "neutral" ? "more" : "better"}</span>
-                </div>
-              )}
-              {metricType === "checkbox" && (
-                <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-                  <div
-                    className="w-3 h-3 rounded-sm"
-                    style={{
-                      backgroundColor: direction === "decrease" ? "var(--status-danger)" : "var(--heat-4)",
-                    }}
-                  />
-                  <span>Done</span>
-                </div>
+        <CardContent className="py-3 px-3 sm:px-6 space-y-3">
+          <div className="flex items-center justify-between gap-2 min-h-8">
+            <div className="text-sm whitespace-nowrap">
+              {hoveredCell ? (
+                <span>
+                  <span className="font-mono font-medium">{formatCellValue(hoveredCell.value, metricType)}</span>
+                  <span className="text-muted-foreground ml-2">{formatShortDate(hoveredCell.date)}</span>
+                </span>
+              ) : (
+                <span className="text-muted-foreground">Tap a day to see everything logged</span>
               )}
             </div>
-
-            {/* Bottom row: Year stats */}
-            {yearStats && (
-              <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-sm">
-                <div>
-                  <span className="font-mono">{yearStats.count}</span>
-                  <span className="text-muted-foreground ml-1">days</span>
+            {isNumeric ? (
+              <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                <span className="hidden sm:inline">{direction === "neutral" ? "less" : "worse"}</span>
+                <div className="flex gap-0.5">
+                  {LEGEND_COLORS.map((color) => (
+                    <div key={color} className="w-3 h-3 sm:w-4 sm:h-4 rounded-sm" style={{ backgroundColor: color }} />
+                  ))}
                 </div>
-                {showAvg && (
-                  <div>
-                    <span className="font-mono">{formatValue(yearStats.avg, metricType)}</span>
-                    <span className="text-muted-foreground ml-1">avg</span>
-                  </div>
-                )}
-                {showTotal && (
-                  <div>
-                    <span className="font-mono">{formatValue(yearStats.sum, metricType)}</span>
-                    <span className="text-muted-foreground ml-1">total</span>
-                  </div>
-                )}
-                {showMinMax && (
-                  <>
-                    <div>
-                      <span className="font-mono">{formatValue(yearStats.min, metricType)}</span>
-                      <span className="text-muted-foreground ml-1">min</span>
-                    </div>
-                    <div>
-                      <span className="font-mono">{formatValue(yearStats.max, metricType)}</span>
-                      <span className="text-muted-foreground ml-1">max</span>
-                    </div>
-                  </>
-                )}
-                {dailyGoal && yearStats.goalMetCount > 0 && (
-                  <div>
-                    <span className="font-mono">{yearStats.goalMetCount}</span>
-                    <span className="text-muted-foreground ml-1">🏆 goals</span>
-                  </div>
-                )}
+                <span className="hidden sm:inline">{direction === "neutral" ? "more" : "better"}</span>
+              </div>
+            ) : (
+              <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                <div
+                  className="w-3 h-3 rounded-sm"
+                  style={{ backgroundColor: direction === "decrease" ? "var(--status-danger)" : "var(--heat-4)" }}
+                />
+                <span>Done</span>
               </div>
             )}
           </div>
+
+          {stats && (
+            <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-sm">
+              {isNumeric && (
+                <>
+                  <span>
+                    <span className="font-mono">{formatCellValue(stats.avg, metricType)}</span>
+                    <span className="text-muted-foreground ml-1">avg</span>
+                  </span>
+                  {showTotal && (
+                    <span>
+                      <span className="font-mono">{formatCellValue(stats.sum, metricType)}</span>
+                      <span className="text-muted-foreground ml-1">total</span>
+                    </span>
+                  )}
+                  <span>
+                    <span className="font-mono">{formatCellValue(stats.min, metricType)}</span>
+                    <span className="text-muted-foreground ml-1">min</span>
+                  </span>
+                  <span>
+                    <span className="font-mono">{formatCellValue(stats.max, metricType)}</span>
+                    <span className="text-muted-foreground ml-1">max</span>
+                  </span>
+                </>
+              )}
+              {dailyGoal && stats.goalMetCount > 0 && (
+                <span className="flex items-center gap-1">
+                  <span className="inline-block h-3 w-3 rounded-sm" style={{ boxShadow: "inset 0 0 0 1.5px var(--status-good)" }} />
+                  <span className="font-mono">{stats.goalMetCount}</span>
+                  <span className="text-muted-foreground">goal days</span>
+                </span>
+              )}
+            </div>
+          )}
+
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-2 pt-2 border-t text-xs">
+            {isNumeric && (
+              <div className="flex items-center gap-2">
+                <span className="text-muted-foreground">Color</span>
+                <Segmented<HeatScale>
+                  value={scale}
+                  onChange={changeScale}
+                  options={[
+                    { value: "percentile", label: "Percentile" },
+                    { value: "range", label: "Min–max" },
+                  ]}
+                />
+              </div>
+            )}
+            <div className="flex flex-wrap items-center gap-2 min-w-0">
+              <span className="text-muted-foreground">Overlay</span>
+              <Select value={overlayId ?? NO_OVERLAY} onValueChange={changeOverlay}>
+                <SelectTrigger className="h-8 w-[170px] text-xs">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={NO_OVERLAY}>None</SelectItem>
+                  {config
+                    .filter((m) => m.metric_id !== selectedMetric)
+                    .map((m) => (
+                      <SelectItem key={m.metric_id} value={m.metric_id}>
+                        {m.metric_name}
+                      </SelectItem>
+                    ))}
+                </SelectContent>
+              </Select>
+              {overlayId && (
+                <Segmented<"same" | "next">
+                  value={overlayLag}
+                  onChange={changeOverlayLag}
+                  options={[
+                    { value: "same", label: "Same day" },
+                    { value: "next", label: "Next day" },
+                  ]}
+                />
+              )}
+            </div>
+          </div>
+
+          {overlay && (
+            <div className="text-xs text-muted-foreground flex flex-wrap items-center gap-x-2 gap-y-1">
+              <span className="inline-flex items-center gap-1">
+                <span
+                  className="inline-block h-2 w-2 rounded-full"
+                  style={{ backgroundColor: "var(--status-warning)", boxShadow: "0 0 0 1px rgba(0,0,0,0.45)" }}
+                />
+                {overlay.label}
+              </span>
+              {overlayCompare ? (
+                <span>
+                  · {selectedConfig?.metric_name}{" "}
+                  <span className="font-mono text-foreground">{fmtAvg(overlayCompare.withAvg, metricType)}</span> on dot days
+                  ({overlayCompare.withN}) vs{" "}
+                  <span className="font-mono text-foreground">{fmtAvg(overlayCompare.withoutAvg, metricType)}</span> other
+                  days ({overlayCompare.withoutN})
+                </span>
+              ) : (
+                <span>· not enough overlapping days to compare</span>
+              )}
+            </div>
+          )}
         </CardContent>
       </Card>
 
       {/* Heatmap */}
       <Card>
-        <CardHeader>
-          <CardTitle className="text-base">
-            {selectedConfig?.metric_name} - {selectedYear}
-          </CardTitle>
+        <CardHeader className="pb-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="min-w-0">
+              <CardTitle className="text-base truncate">{selectedConfig?.metric_name}</CardTitle>
+              <div className="text-xs text-muted-foreground">
+                {dataLoading
+                  ? "Loading…"
+                  : `${period.label} · ${formatShortDate(period.start)} – ${formatShortDate(period.end)}`}
+              </div>
+            </div>
+            <Segmented<View>
+              value={view}
+              onChange={changeView}
+              options={[
+                { value: "weeks", label: "Weeks" },
+                { value: "months", label: "Months" },
+                { value: "year", label: "Year" },
+              ]}
+            />
+          </div>
         </CardHeader>
-        <CardContent>
-          {view === "months" ? (
-            <CalendarHeatmap
-              data={heatmapData}
-              year={selectedYear}
-              metricType={metricType}
-              direction={direction}
-              selectedDate={hoveredCell?.date}
-              onHover={handleHover}
-              onCellClick={handleCellClick}
-            />
+        <CardContent onTouchStart={onTouchStart} onTouchEnd={onTouchEnd}>
+          {view === "weeks" ? (
+            <WeekGrid {...gridProps} />
+          ) : view === "months" ? (
+            <CalendarHeatmap {...gridProps} />
           ) : (
-            <YearGrid
-              data={heatmapData}
-              year={selectedYear}
-              metricType={metricType}
-              direction={direction}
-              selectedDate={hoveredCell?.date}
-              onHover={handleHover}
-              onCellClick={handleCellClick}
-            />
+            <YearGrid {...gridProps} />
+          )}
+          {view !== "year" && (
+            <p className="sm:hidden mt-3 text-center text-[11px] text-muted-foreground">Swipe to change metric</p>
           )}
         </CardContent>
       </Card>
+
+      {!dataLoading && (
+        <HeatmapPatterns
+          data={heatmapData}
+          metricType={metricType}
+          direction={direction}
+          start={period.start}
+          end={period.end}
+          since={selectedConfig?.start_date}
+        />
+      )}
+
+      <DayDetailSheet
+        open={detailOpen}
+        onOpenChange={setDetailOpen}
+        date={detailDate}
+        onDateChange={setDetailDate}
+        metrics={allActive}
+        highlightMetricId={selectedMetric}
+      />
     </main>
   );
 }
+
