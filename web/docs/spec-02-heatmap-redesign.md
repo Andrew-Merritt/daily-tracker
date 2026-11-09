@@ -1,7 +1,7 @@
 # Spec 02 — Heatmap Redesign
 
 Last updated: 2026-07-17
-Status: ⬜ pending
+Status: ✅ done — Phases 1–2 333e945, Phase 3 0b59e98, Phase 4 6ad5c9a (later polish: 1c79a48)
 Model: **Sonnet 5** (Phase 4 stat tiles may be split off to Haiku 4.5)
 Depends on: spec-01 Phase A (tokens)
 
