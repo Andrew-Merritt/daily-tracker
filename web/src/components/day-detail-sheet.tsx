@@ -6,7 +6,7 @@ import { ChevronLeft, ChevronRight, Check, Minus, Pencil } from "lucide-react";
 import { getAuthHeaders } from "@/lib/authHeaders";
 import { addDays } from "@/lib/dateUtils";
 import { useMediaQuery } from "@/hooks/use-media-query";
-import { formatCellValue, type HeatmapMetricType } from "@/components/calendar-heatmap";
+import { formatCellValue, sortMetricsForDisplay, type HeatmapMetricType } from "@/lib/heatmap";
 import { Button, buttonVariants } from "@/components/ui/button";
 import {
   Sheet,
@@ -53,26 +53,6 @@ function formatLongDate(date: string): string {
     month: "short",
     day: "numeric",
     year: "numeric",
-  });
-}
-
-function sortMetrics(list: DayDetailMetric[]): DayDetailMetric[] {
-  const groupOrder = new Map<string, number>();
-  for (const m of list) {
-    const key = m.group || "";
-    const cur = groupOrder.get(key);
-    const cand = m.group_order ?? 0;
-    if (cur === undefined || cand < cur) groupOrder.set(key, cand);
-  }
-  return [...list].sort((a, b) => {
-    const ga = a.group || "";
-    const gb = b.group || "";
-    const d = (groupOrder.get(ga) ?? 0) - (groupOrder.get(gb) ?? 0);
-    if (d !== 0) return d;
-    if (ga !== gb) return ga.localeCompare(gb);
-    const o = (a.metric_order ?? 0) - (b.metric_order ?? 0);
-    if (o !== 0) return o;
-    return a.metric_id.localeCompare(b.metric_id);
   });
 }
 
@@ -140,7 +120,7 @@ export function DayDetailSheet({
     const byId = new Map(rows.map((r) => [r.metric_id, r]));
 
     // Only metrics that existed on this date (start_date on or before it).
-    const visible = sortMetrics(
+    const visible = sortMetricsForDisplay(
       metrics.filter(
         (m) => (showPrivate || !m.private) && (!m.start_date || m.start_date <= date)
       )

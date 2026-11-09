@@ -2,111 +2,50 @@
 
 import { memo, useMemo } from "react";
 import { Card, CardContent } from "@/components/ui/card";
+import {
+  eachMonth,
+  formatCellValue,
+  formatShortDate,
+  formatTileValue,
+  heatColors,
+  localToday,
+  type Bucket,
+  type HeatmapDataPoint,
+  type HeatmapDirection,
+  type HeatmapMetricType,
+} from "@/lib/heatmap";
 
-export type HeatmapDataPoint = {
-  date: string;
-  value: number;
-  goalMet?: boolean;
-};
+// Re-exported so existing imports keep working.
+export {
+  formatCellValue,
+  formatTileValue,
+  formatHHMM,
+  formatDuration,
+  type HeatmapDataPoint,
+  type HeatmapDirection,
+  type HeatmapMetricType,
+} from "@/lib/heatmap";
 
-export type HeatmapMetricType = "number" | "checkbox" | "hhmm" | "time" | "score" | "count" | "text";
-export type HeatmapDirection = "increase" | "decrease" | "neutral";
-
-export type CalendarHeatmapProps = {
+/** Props shared by every heatmap view (weeks / months / year). */
+export type HeatGridProps = {
   data: HeatmapDataPoint[];
+  /** Inclusive YYYY-MM-DD range to draw. */
+  start: string;
+  end: string;
   metricType?: HeatmapMetricType;
   direction?: HeatmapDirection;
-  year?: number;
+  /** Value → color bucket for the period (see makeBucketer). */
+  bucketOf: (v: number) => Bucket;
   selectedDate?: string | null;
+  /** Dates that get an overlay dot. */
+  markers?: Set<string> | null;
   onHover?: (cell: { date: string; value: number } | null) => void;
   onCellClick?: (date: string, value: number | undefined) => void;
 };
 
-function formatHHMM(totalMinutes: number): string {
-  if (!Number.isFinite(totalMinutes)) return "";
-  const minutes = Math.max(0, Math.min(23 * 60 + 59, Math.round(totalMinutes)));
-  const h = Math.floor(minutes / 60);
-  const m = minutes % 60;
-  return `${h}:${String(m).padStart(2, "0")}`;
-}
+export type CellVariant = "year" | "month" | "week";
 
-function formatDuration(totalMinutes: number): string {
-  if (!Number.isFinite(totalMinutes)) return "";
-  const minutes = Math.max(0, Math.round(totalMinutes));
-  const h = Math.floor(minutes / 60);
-  const m = minutes % 60;
-  if (h === 0) return `${m}m`;
-  return `${h}:${String(m).padStart(2, "0")}`;
-}
-
-/** Bucket a value into a quintile of the visible range, 1 (lowest) to 5 (highest). */
-export function heatBucket(value: number, min: number, max: number): 1 | 2 | 3 | 4 | 5 {
-  const t = (value - min) / (max - min || 1);
-  return (Math.min(4, Math.floor(t * 5)) + 1) as 1 | 2 | 3 | 4 | 5;
-}
-
-/** Resolve the CSS color for a data cell given its value and the metric's config. */
-export function getHeatCellColor(
-  value: number,
-  min: number,
-  max: number,
-  metricType: HeatmapMetricType,
-  direction: HeatmapDirection
-): string {
-  if (metricType === "checkbox") {
-    if (value >= 0.5) {
-      return direction === "decrease" ? "var(--status-danger)" : "var(--heat-4)";
-    }
-    return "transparent";
-  }
-  let bucket = heatBucket(value, min, max);
-  if (direction === "decrease") bucket = (6 - bucket) as 1 | 2 | 3 | 4 | 5;
-  return `var(--heat-${bucket})`;
-}
-
-/** Text color readable against the cell's background (mirrors getHeatCellColor). */
-export function getHeatCellTextColor(
-  value: number,
-  min: number,
-  max: number,
-  metricType: HeatmapMetricType,
-  direction: HeatmapDirection
-): string {
-  if (metricType === "checkbox") {
-    return direction === "decrease" ? "var(--heat-fg-danger)" : "var(--heat-fg-4)";
-  }
-  let bucket = heatBucket(value, min, max);
-  if (direction === "decrease") bucket = (6 - bucket) as 1 | 2 | 3 | 4 | 5;
-  return `var(--heat-fg-${bucket})`;
-}
-
-/** Compact value for inside a tile (checkbox shows a check mark). */
-export function formatTileValue(value: number, metricType: HeatmapMetricType): string {
-  if (metricType === "checkbox") return value >= 0.5 ? "✓" : "";
-  if (metricType === "hhmm" || metricType === "time") return formatCellValue(value, metricType);
-  const rounded = Math.round(value * 10) / 10;
-  return String(rounded);
-}
-
-export function formatCellValue(value: number, metricType: HeatmapMetricType): string {
-  switch (metricType) {
-    case "hhmm":
-      return formatHHMM(value);
-    case "time":
-      return formatDuration(value);
-    case "checkbox":
-      return value >= 0.5 ? "Yes" : "No";
-    default:
-      return String(Math.round(value * 100) / 100);
-  }
-}
-
-function formatCellDate(date: string): string {
-  const d = new Date(`${date}T00:00:00`);
-  return d.toLocaleString("default", { month: "short", day: "numeric" });
-}
-
-type HeatCellProps = {
+export type ResolvedCell = {
   date: string;
   value: number | undefined;
   bgColor: string;
@@ -115,126 +54,145 @@ type HeatCellProps = {
   title: string;
   isEmpty: boolean;
   isGoalMet: boolean;
-  isSelected: boolean;
-  onHover?: (cell: { date: string; value: number } | null) => void;
-  onCellClick?: (date: string, value: number | undefined) => void;
-  /** Fixed pixel size (year view); omit for aspect-square fill. */
-  size?: number;
+  isFuture: boolean;
+  hasMarker: boolean;
 };
 
-function localToday(): string {
-  const d = new Date();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+/** Lookup maps + a resolver that turns a date into everything a cell needs. */
+export function useCellResolver({
+  data,
+  metricType = "number",
+  direction = "increase",
+  bucketOf,
+  markers,
+}: Pick<HeatGridProps, "data" | "metricType" | "direction" | "bucketOf" | "markers">) {
+  const maps = useMemo(() => {
+    const value = new Map<string, number>();
+    const goal = new Map<string, boolean>();
+    for (const d of data) {
+      value.set(d.date, d.value);
+      if (d.goalMet !== undefined) goal.set(d.date, d.goalMet);
+    }
+    return { value, goal };
+  }, [data]);
+
+  const today = localToday();
+
+  return (date: string): ResolvedCell => {
+    const value = maps.value.get(date);
+    const hasValue = value !== undefined;
+    const isChecked = metricType === "checkbox" && hasValue && value >= 0.5;
+    const isEmpty = !hasValue || (metricType === "checkbox" && !isChecked);
+    const isGoalMet = !!maps.goal.get(date);
+    const colors = hasValue ? heatColors(value, bucketOf, metricType, direction) : null;
+    const hasMarker = !!markers?.has(date);
+    return {
+      date,
+      value,
+      bgColor: colors?.bg ?? "var(--heat-empty)",
+      fgColor: colors?.fg,
+      text: hasValue && !isEmpty ? formatTileValue(value, metricType) : "",
+      title:
+        (hasValue
+          ? `${formatShortDate(date)} — ${formatCellValue(value, metricType)}${isGoalMet ? " · Goal met" : ""}`
+          : formatShortDate(date)) + (hasMarker ? " · ●" : ""),
+      isEmpty,
+      isGoalMet,
+      isFuture: date > today,
+      hasMarker,
+    };
+  };
 }
+
+type HeatCellProps = ResolvedCell & {
+  variant: CellVariant;
+  isSelected: boolean;
+  onHover?: HeatGridProps["onHover"];
+  onCellClick?: HeatGridProps["onCellClick"];
+};
+
+const VARIANT_STYLES: Record<CellVariant, { box: string; inner: string; dot: string }> = {
+  year: { box: "w-3 h-3", inner: "rounded-[2px] text-[6px]", dot: "h-[4px] w-[4px] top-0 right-0" },
+  month: { box: "aspect-square", inner: "rounded-[3px] text-[8px]", dot: "h-[5px] w-[5px] top-[1px] right-[1px]" },
+  week: { box: "aspect-square", inner: "rounded-md text-xs", dot: "h-2 w-2 top-1 right-1" },
+};
 
 /** Memoized so a hover only re-renders the cells whose selected state changed. */
 export const HeatCell = memo(function HeatCell({
-  date, value, bgColor, fgColor, text, title, isEmpty, isGoalMet, isSelected, onHover, onCellClick, size,
+  date,
+  value,
+  bgColor,
+  fgColor,
+  text,
+  title,
+  isEmpty,
+  isGoalMet,
+  isFuture,
+  hasMarker,
+  isSelected,
+  variant,
+  onHover,
+  onCellClick,
 }: HeatCellProps) {
   const hasValue = value !== undefined;
   // Any day up to today can be tapped (opens the day's full log); only days
   // with a value get the hover pop.
-  const clickable = !!onCellClick && date <= localToday();
+  const clickable = !!onCellClick && !isFuture;
+  const v = VARIANT_STYLES[variant];
   // The outer element keeps the un-scaled hit box and owns all mouse events; the
   // inner element does the visual pop with pointer-events-none, so an enlarged
   // tile never steals hover from its neighbors during fast sweeps.
   return (
     <div
       title={title}
-      className={`group relative ${size ? "" : "aspect-square"} ${
-        clickable ? "cursor-pointer" : "cursor-default"
-      } ${hasValue ? "hover:z-30" : ""} ${isSelected ? "z-20" : ""}`}
-      style={{ width: size, height: size }}
+      className={`group relative ${v.box} ${clickable ? "cursor-pointer" : "cursor-default"} ${
+        hasValue ? "hover:z-30" : ""
+      } ${isSelected ? "z-20" : ""}`}
       onMouseEnter={() => hasValue && onHover?.({ date, value })}
       onMouseLeave={() => onHover?.(null)}
       onClick={() => clickable && onCellClick?.(date, value)}
     >
       <div
         className={`pointer-events-none absolute inset-0 flex items-center justify-center font-medium leading-none tabular-nums transition-transform duration-100 ${
-          size ? "rounded-[2px] text-[6px]" : "rounded-[3px] text-[8px]"
+          v.inner
         } ${
           hasValue ? "group-hover:scale-[1.33] group-hover:shadow-md group-hover:ring-1 group-hover:ring-foreground/40" : ""
         } ${isSelected ? "ring-2 ring-foreground" : ""}`}
         style={{
           backgroundColor: bgColor,
           color: fgColor,
-          opacity: isEmpty ? 0.35 : 1,
+          opacity: isFuture ? 0.12 : isEmpty ? 0.35 : 1,
           boxShadow: isGoalMet ? "inset 0 0 0 1.5px var(--status-good)" : undefined,
         }}
       >
-        {text}
+        {variant === "week" && (
+          <span className="absolute left-1 top-0.5 text-[9px] font-normal opacity-60" style={{ color: fgColor }}>
+            {Number(date.slice(8))}
+          </span>
+        )}
+        {/* Year tiles are 12px — color only; the value is in the tooltip / tap. */}
+        {variant !== "year" && text}
+        {hasMarker && (
+          <span
+            className={`absolute rounded-full ${v.dot}`}
+            style={{ backgroundColor: "var(--status-warning)", boxShadow: "0 0 0 1px rgba(0,0,0,0.45)" }}
+          />
+        )}
       </div>
     </div>
   );
 });
 
-export function CalendarHeatmap({
-  data,
-  metricType = "number",
-  direction = "increase",
-  year,
-  selectedDate,
-  onHover,
-  onCellClick,
-}: CalendarHeatmapProps) {
-  const valueMap = useMemo(() => {
-    const m = new Map<string, number>();
-    for (const d of data) m.set(d.date, d.value);
-    return m;
-  }, [data]);
+const DAY_LABELS = ["S", "M", "T", "W", "T", "F", "S"];
 
-  const goalMetMap = useMemo(() => {
-    const m = new Map<string, boolean>();
-    for (const d of data) {
-      if (d.goalMet !== undefined) m.set(d.date, d.goalMet);
-    }
-    return m;
-  }, [data]);
-
-  // Filter data by year if specified
-  const filteredData = useMemo(() => {
-    if (!year) return data;
-    const yearStr = String(year);
-    return data.filter((d) => d.date.startsWith(yearStr));
-  }, [data, year]);
-
-  // Months in chronological order (Jan-Dec)
-  const months = useMemo(() => {
-    if (year) {
-      // Always show all 12 months for the selected year
-      const result: string[] = [];
-      for (let m = 1; m <= 12; m++) {
-        result.push(`${year}-${String(m).padStart(2, "0")}`);
-      }
-      return result; // Jan to Dec order
-    }
-    if (filteredData.length === 0) return [];
-
-    const sorted = [...filteredData].sort((a, b) => a.date.localeCompare(b.date));
-    const first = sorted[0].date;
-    const last = sorted[sorted.length - 1].date;
-    const result: string[] = [];
-    const d = new Date(first.slice(0, 7) + "-01T00:00:00");
-    const end = new Date(last.slice(0, 7) + "-01T00:00:00");
-    while (d <= end) {
-      result.push(d.toISOString().slice(0, 7));
-      d.setMonth(d.getMonth() + 1);
-    }
-    return result.sort(); // Chronological order
-  }, [filteredData, year]);
-
-  const allValues = filteredData.map((d) => d.value);
-  const minVal = allValues.length > 0 ? Math.min(...allValues) : 0;
-  const maxVal = allValues.length > 0 ? Math.max(...allValues) : 1;
-
-  const DAY_LABELS = ["S", "M", "T", "W", "T", "F", "S"];
+/** Grid of month cards (one per month in range). */
+export function CalendarHeatmap(props: HeatGridProps) {
+  const { start, end, selectedDate, onHover, onCellClick } = props;
+  const resolve = useCellResolver(props);
+  const months = useMemo(() => eachMonth(start, end), [start, end]);
 
   if (months.length === 0) {
-    return (
-      <div className="text-sm text-muted-foreground text-center py-8">
-        No data available for the selected period.
-      </div>
-    );
+    return <div className="text-sm text-muted-foreground text-center py-8">No data for this period.</div>;
   }
 
   return (
@@ -243,13 +201,8 @@ export function CalendarHeatmap({
         const [y, m] = month.split("-").map(Number);
         const firstDay = new Date(y, m - 1, 1);
         const daysInMonth = new Date(y, m, 0).getDate();
-        const startDow = firstDay.getDay();
-        const cells: (null | { day: number; date: string; value: number | undefined })[] = [];
-        for (let i = 0; i < startDow; i++) cells.push(null);
-        for (let day = 1; day <= daysInMonth; day++) {
-          const ds = `${month}-${String(day).padStart(2, "0")}`;
-          cells.push({ day, date: ds, value: valueMap.get(ds) });
-        }
+        const cells: (string | null)[] = Array.from({ length: firstDay.getDay() }, () => null);
+        for (let day = 1; day <= daysInMonth; day++) cells.push(`${month}-${String(day).padStart(2, "0")}`);
 
         return (
           <Card key={month}>
@@ -263,40 +216,15 @@ export function CalendarHeatmap({
                     {d}
                   </div>
                 ))}
-                {cells.map((cell, i) => {
-                  if (!cell) return <div key={`e${i}`} />;
-                  const hasValue = cell.value !== undefined;
-                  const isChecked = metricType === "checkbox" && hasValue && cell.value! >= 0.5;
-                  const isEmpty = !hasValue || (metricType === "checkbox" && !isChecked);
-                  const isGoalMet = goalMetMap.get(cell.date);
-                  const isSelected = selectedDate === cell.date;
-
-                  const bgColor = hasValue
-                    ? getHeatCellColor(cell.value!, minVal, maxVal, metricType, direction)
-                    : "var(--heat-empty)";
-
-                  const title = hasValue
-                    ? `${formatCellDate(cell.date)} — ${formatCellValue(cell.value!, metricType)}${
-                        isGoalMet ? " · Goal met" : ""
-                      }`
-                    : formatCellDate(cell.date);
-
+                {cells.map((date, i) => {
+                  if (!date || date < start) return <div key={`e${i}`} />;
+                  const c = resolve(date);
                   return (
                     <HeatCell
-                      key={cell.date}
-                      date={cell.date}
-                      value={cell.value}
-                      bgColor={bgColor}
-                      fgColor={
-                        hasValue
-                          ? getHeatCellTextColor(cell.value!, minVal, maxVal, metricType, direction)
-                          : undefined
-                      }
-                      text={hasValue && !isEmpty ? formatTileValue(cell.value!, metricType) : ""}
-                      title={title}
-                      isEmpty={isEmpty}
-                      isGoalMet={!!isGoalMet}
-                      isSelected={isSelected}
+                      key={date}
+                      {...c}
+                      variant="month"
+                      isSelected={selectedDate === date}
                       onHover={onHover}
                       onCellClick={onCellClick}
                     />
@@ -310,15 +238,3 @@ export function CalendarHeatmap({
     </div>
   );
 }
-
-/**
- * 5 swatches reading low → high intensity. Per-cell colors already apply the
- * direction inversion (see getHeatCellColor), so worst → best always reads
- * as heat-1 → heat-5 regardless of direction; `direction` is accepted for
- * API symmetry with the per-cell rule and potential future use.
- */
-export function getHeatmapLegendColors(_direction: HeatmapDirection): string[] {
-  return [1, 2, 3, 4, 5].map((b) => `var(--heat-${b})`);
-}
-
-export { formatHHMM, formatDuration };
