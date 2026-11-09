@@ -3,6 +3,7 @@
 import * as React from "react";
 import { cn } from "@/lib/utils";
 import { useSpeechInput } from "@/hooks/useSpeechInput";
+import { useToast } from "@/components/ui/Toast";
 
 export interface SpeechTextareaProps
   extends React.TextareaHTMLAttributes<HTMLTextAreaElement> {
@@ -12,8 +13,8 @@ export interface SpeechTextareaProps
 
 /**
  * Drop-in replacement for <textarea> / <Textarea> that adds a mic button
- * for speech-to-text input. Uses the STT provider from @/lib/stt — swap
- * the provider there to transition from Web Speech API to Whisper.
+ * for speech-to-text input. Uses the STT provider from @/lib/stt (OpenAI
+ * transcription via /api/transcribe, falling back to the Web Speech API).
  */
 const SpeechTextarea = React.forwardRef<
   HTMLTextAreaElement,
@@ -30,11 +31,26 @@ const SpeechTextarea = React.forwardRef<
     [onChange]
   );
 
-  const { isSupported, isListening, interim, startListening, stopListening, cancel } =
-    useSpeechInput({
-      value: value as string,
-      onChange: handleChange,
-    });
+  const { toast } = useToast();
+  const handleError = React.useCallback(
+    (message: string) => toast(message, "error"),
+    [toast]
+  );
+
+  const {
+    isSupported,
+    isListening,
+    isTranscribing,
+    interim,
+    startListening,
+    stopListening,
+    cancel,
+  } = useSpeechInput({
+    value: value as string,
+    onChange: handleChange,
+    onError: handleError,
+  });
+  const isBusy = isListening || isTranscribing;
 
   return (
     <div className="relative">
@@ -44,16 +60,18 @@ const SpeechTextarea = React.forwardRef<
         onChange={onChange}
         className={cn(
           "flex min-h-[60px] w-full rounded-md border border-input bg-transparent px-3 py-2 text-sm shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50",
-          isListening && "pr-16",
+          isBusy && "pr-16",
           className
         )}
         autoCapitalize={(props.autoCapitalize as string) ?? "sentences"}
         {...props}
+        // Typing while the transcript is in flight would be overwritten.
+        readOnly={isTranscribing || props.readOnly}
       />
 
       {isSupported && (
         <div className="absolute bottom-2 right-2 flex items-center gap-1">
-          {isListening && (
+          {isBusy && (
             <button
               type="button"
               onMouseDown={(e) => e.preventDefault()}
@@ -83,16 +101,32 @@ const SpeechTextarea = React.forwardRef<
             type="button"
             onMouseDown={(e) => e.preventDefault()}
             onClick={isListening ? stopListening : startListening}
+            disabled={isTranscribing}
             className={cn(
               "flex items-center justify-center w-6 h-6 rounded transition-colors",
               isListening
                 ? "text-red-500 hover:text-red-600"
                 : "text-muted-foreground hover:text-foreground"
             )}
-            title={isListening ? "Stop recording" : "Start voice input"}
-            aria-label={isListening ? "Stop recording" : "Start voice input"}
+            title={
+              isTranscribing
+                ? "Transcribing…"
+                : isListening
+                  ? "Stop recording"
+                  : "Start voice input"
+            }
+            aria-label={
+              isTranscribing
+                ? "Transcribing"
+                : isListening
+                  ? "Stop recording"
+                  : "Start voice input"
+            }
           >
-            {isListening ? (
+            {isTranscribing ? (
+              // Spinner while the server transcribes
+              <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-muted-foreground border-t-transparent" />
+            ) : isListening ? (
               // Pulsing dot to indicate active recording
               <span className="relative flex h-3 w-3">
                 <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75" />
