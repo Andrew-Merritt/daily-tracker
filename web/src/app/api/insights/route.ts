@@ -1,5 +1,17 @@
 import { NextResponse } from "next/server";
 import { supabaseServerFromRequest } from "@/lib/supabaseServer";
+import { fetchAllRows } from "@/lib/fetchAllRows";
+import {
+  analyzeDayOfWeek,
+  analyzeRelationships,
+  analyzeTrends,
+  buildSeries,
+  calcInputs,
+  isNumericType,
+  metricHigherIsBetter,
+  trackedDaysFrom,
+  type EngineMetric,
+} from "@/lib/insights/engine";
 import type {
   Metric,
   LogRow,
@@ -29,616 +41,225 @@ export async function GET(req: Request) {
     return NextResponse.json({ error: "Not authenticated" }, { status: 401 });
   }
 
-  // Check for showPrivate query param
   const url = new URL(req.url);
   const showPrivate = url.searchParams.get("showPrivate") === "true";
 
-  // Get all active metrics (including calc_expr to filter redundant correlations)
   const { data: metrics, error: configError } = await supabase
     .from("config")
-    .select("metric_id, metric_name, type, private, is_calculated, calc_expr, analytics_config")
+    .select("metric_id, metric_name, type, private, is_calculated, calc_expr, analytics_config, start_date, required")
     .eq("owner_id", user.id)
     .eq("active", true);
 
   if (configError) {
-    return NextResponse.json(
-      { error: `Failed to load config: ${configError.message}` },
-      { status: 500 }
-    );
+    return NextResponse.json({ error: `Failed to load config: ${configError.message}` }, { status: 500 });
   }
 
   const allRawMetrics = (metrics ?? []) as Metric[];
-  const privateMetricIds = new Set(
-    allRawMetrics.filter((m) => m.private).map((m) => m.metric_id)
-  );
+  const privateMetricIds = new Set(allRawMetrics.filter((m) => m.private).map((m) => m.metric_id));
   const higherIsBetterMap = new Map<string, boolean>();
-  for (const m of allRawMetrics) {
-    higherIsBetterMap.set(
-      m.metric_id,
-      m.analytics_config?.higher_is_better !== false
-    );
-  }
-  const allMetrics = allRawMetrics.filter(
-    (m) => showPrivate || !m.private
-  );
+  for (const m of allRawMetrics) higherIsBetterMap.set(m.metric_id, metricHigherIsBetter(m.analytics_config));
+  const allMetrics = allRawMetrics.filter((m) => showPrivate || !m.private);
 
   const checkboxMetrics = allMetrics.filter((m) => m.type === "checkbox");
-  const numericMetrics = allMetrics.filter((m) =>
-    ["number", "score", "time", "hhmm", "count", "calculated"].includes(m.type)
-  );
+  const numericMetrics = allMetrics.filter((m) => isNumericType(m.type));
 
-  // Build a set of all metric IDs for validation
-  const allMetricIds = new Set(allMetrics.map((m) => m.metric_id));
+  const empty: InsightsResponse = {
+    checkboxNumeric: [],
+    checkboxCheckbox: [],
+    numericNumeric: [],
+    timeLagged: [],
+    dayOfWeek: [],
+    trends: [],
+    histograms: [],
+    cumulative: [],
+    yearOverYear: [],
+    streakTimelines: [],
+    candlesticks: [],
+    totalDays: 0,
+    dateRange: null,
+  };
+  if (allMetrics.length === 0) return NextResponse.json(empty);
 
-  // Build a map of calculated metrics -> their referenced metric IDs
-  const calculatedDependencies = new Map<string, Set<string>>();
-  for (const m of allMetrics) {
-    if (m.is_calculated && m.calc_expr) {
-      const refs = new Set<string>();
-      const regex = /[a-zA-Z_][a-zA-Z0-9_]*/g;
-      let match;
-      while ((match = regex.exec(m.calc_expr)) !== null) {
-        const id = match[0];
-        if (allMetricIds.has(id) && id !== m.metric_id) {
-          refs.add(id);
-        }
-      }
-      if (refs.size > 0) {
-        calculatedDependencies.set(m.metric_id, refs);
-      }
-    }
+  // Load every active metric's logs (private ones too: a required private
+  // metric still marks a day as tracked). Pages are fetched in parallel.
+  const activeIds = allRawMetrics.map((m) => m.metric_id);
+  let logRows: LogRow[];
+  try {
+    logRows = await fetchAllRows<LogRow>((withCount) =>
+      supabase
+        .from("log")
+        .select("metric_id, date, value", withCount ? { count: "exact" } : undefined)
+        .eq("owner_id", user.id)
+        .in("metric_id", activeIds)
+        .order("date", { ascending: true })
+        .order("metric_id", { ascending: true })
+    );
+  } catch (e) {
+    return NextResponse.json({ error: `Failed to load logs: ${e instanceof Error ? e.message : e}` }, { status: 500 });
   }
 
-  const metricIds = allMetrics.map((m) => m.metric_id);
-
-  if (metricIds.length === 0) {
-    const empty: InsightsResponse = {
-      checkboxNumeric: [],
-      checkboxCheckbox: [],
-      numericNumeric: [],
-      timeLagged: [],
-      dayOfWeek: [],
-      trends: [],
-      histograms: [],
-      cumulative: [],
-      yearOverYear: [],
-      streakTimelines: [],
-      candlesticks: [],
-      totalDays: 0,
-      dateRange: null,
-    };
-    return NextResponse.json(empty);
-  }
-
-  // Load all logs (fetch all for this user, filter by metric in code)
-  const allLogs: LogRow[] = [];
-  const PAGE_SIZE = 1000;
-  let offset = 0;
-  let hasMore = true;
-
-  while (hasMore) {
-    const { data: logs, error: logError } = await supabase
-      .from("log")
-      .select("metric_id, date, value")
-      .eq("owner_id", user.id)
-      .order("date", { ascending: true })
-      .range(offset, offset + PAGE_SIZE - 1);
-
-    if (logError) {
-      return NextResponse.json(
-        { error: `Failed to load logs: ${logError.message}` },
-        { status: 500 }
-      );
-    }
-
-    const rows = (logs ?? []) as LogRow[];
-    const filtered = rows.filter((r) => metricIds.includes(r.metric_id));
-    allLogs.push(...filtered);
-
-    hasMore = rows.length === PAGE_SIZE;
-    offset += PAGE_SIZE;
-
-    if (offset > 500000) break;
-  }
-
-  const logRows = allLogs;
-
-  // Build maps
+  // Raw per-metric maps for the descriptive sections below.
+  const visibleIds = new Set(allMetrics.map((m) => m.metric_id));
   const byMetric = new Map<string, Map<string, number | null>>();
   const allDates = new Set<string>();
-
   for (const row of logRows) {
-    if (!byMetric.has(row.metric_id)) {
-      byMetric.set(row.metric_id, new Map());
-    }
-    byMetric.get(row.metric_id)!.set(row.date, row.value);
+    if (!visibleIds.has(row.metric_id)) continue;
     allDates.add(row.date);
+    let m = byMetric.get(row.metric_id);
+    if (!m) byMetric.set(row.metric_id, (m = new Map()));
+    m.set(row.date, row.value);
   }
 
   const sortedDates = Array.from(allDates).sort();
   const totalDays = sortedDates.length;
-  const dateRange =
-    sortedDates.length > 0
-      ? { first: sortedDates[0], last: sortedDates[sortedDates.length - 1] }
-      : null;
+  const dateRange = totalDays > 0 ? { first: sortedDates[0], last: sortedDates[totalDays - 1] } : null;
 
-  // Minimum data requirements
-  const MIN_DAYS_EACH_GROUP = 7;
-  const MIN_PERCENT_DIFF = 10;
+  // ---------------------------------------------------------------------------
+  // Relationships, weekday patterns and trends — see lib/insights/engine.ts
+  // ---------------------------------------------------------------------------
+  const engineMetrics: EngineMetric[] = allMetrics.map((m) => ({
+    metric_id: m.metric_id,
+    metric_name: m.metric_name || m.metric_id,
+    type: m.type,
+    private: !!m.private,
+    higherIsBetter: higherIsBetterMap.get(m.metric_id) ?? true,
+    trackedFrom: m.start_date ?? null,
+  }));
+  const requiredIds = new Set(allRawMetrics.filter((m) => m.required).map((m) => m.metric_id));
+  const trackedDays = trackedDaysFrom(logRows, requiredIds);
+  const series = buildSeries(engineMetrics, logRows, trackedDays);
+  const inputs = calcInputs(allRawMetrics);
 
-  // 1) Checkbox → Numeric correlations
+  const priv = (...ids: string[]) => ids.some((id) => privateMetricIds.has(id));
+  const pctDiff = (a: number, b: number) =>
+    b !== 0 ? ((a - b) / Math.abs(b)) * 100 : a > 0 ? 100 : a < 0 ? -100 : 0;
+  const r2 = (x: number) => Math.round(x * 100) / 100;
+  const r1 = (x: number) => Math.round(x * 10) / 10;
+
   const checkboxNumericInsights: CorrelationInsight[] = [];
-
-  for (const cb of checkboxMetrics) {
-    const cbData = byMetric.get(cb.metric_id);
-    if (!cbData) continue;
-
-    for (const num of numericMetrics) {
-      const numData = byMetric.get(num.metric_id);
-      if (!numData) continue;
-
-      const deps = calculatedDependencies.get(num.metric_id);
-      if (deps && deps.has(cb.metric_id)) continue;
-
-      const valuesWhenTrue: number[] = [];
-      const valuesWhenFalse: number[] = [];
-
-      for (const date of sortedDates) {
-        const cbVal = cbData.get(date);
-        const numVal = numData.get(date);
-
-        if (numVal == null) continue;
-
-        const isTrue = cbVal != null && cbVal !== 0;
-
-        if (isTrue) {
-          valuesWhenTrue.push(numVal);
-        } else {
-          valuesWhenFalse.push(numVal);
-        }
-      }
-
-      if (
-        valuesWhenTrue.length < MIN_DAYS_EACH_GROUP ||
-        valuesWhenFalse.length < MIN_DAYS_EACH_GROUP
-      ) {
-        continue;
-      }
-
-      const avgTrue =
-        valuesWhenTrue.reduce((a, b) => a + b, 0) / valuesWhenTrue.length;
-      const avgFalse =
-        valuesWhenFalse.reduce((a, b) => a + b, 0) / valuesWhenFalse.length;
-
-      if (avgFalse === 0 && avgTrue === 0) continue;
-
-      const percentDiff =
-        avgFalse !== 0
-          ? ((avgTrue - avgFalse) / Math.abs(avgFalse)) * 100
-          : avgTrue > 0
-          ? 100
-          : -100;
-
-      if (Math.abs(percentDiff) < MIN_PERCENT_DIFF) continue;
-
-      checkboxNumericInsights.push({
-        type: "checkbox_numeric",
-        id: `cn:${cb.metric_id}:${num.metric_id}`,
-        checkboxMetricId: cb.metric_id,
-        checkboxMetricName: cb.metric_name || cb.metric_id,
-        numericMetricId: num.metric_id,
-        numericMetricName: num.metric_name || num.metric_id,
-        avgWhenTrue: Math.round(avgTrue * 100) / 100,
-        avgWhenFalse: Math.round(avgFalse * 100) / 100,
-        percentDiff: Math.round(percentDiff * 10) / 10,
-        daysTrue: valuesWhenTrue.length,
-        daysFalse: valuesWhenFalse.length,
-        direction: percentDiff > 0 ? "higher" : "lower",
-        involvesPrivate:
-          privateMetricIds.has(cb.metric_id) ||
-          privateMetricIds.has(num.metric_id),
-        numericHigherIsBetter: higherIsBetterMap.get(num.metric_id) ?? true,
-      });
-    }
-  }
-
-  checkboxNumericInsights.sort(
-    (a, b) => Math.abs(b.percentDiff) - Math.abs(a.percentDiff)
-  );
-
-  // 2) Checkbox → Checkbox correlations
+  const timeLaggedInsights: TimeLaggedInsight[] = [];
   const checkboxCheckboxInsights: CheckboxCheckboxInsight[] = [];
+  const numericNumericInsights: NumericNumericInsight[] = [];
 
-  for (let i = 0; i < checkboxMetrics.length; i++) {
-    for (let j = i + 1; j < checkboxMetrics.length; j++) {
-      const metricA = checkboxMetrics[i];
-      const metricB = checkboxMetrics[j];
-
-      const dataA = byMetric.get(metricA.metric_id);
-      const dataB = byMetric.get(metricB.metric_id);
-
-      if (!dataA || !dataB) continue;
-
-      let aTrueBTrue = 0;
-      let aTrueBFalse = 0;
-      let aFalseBTrue = 0;
-      let aFalseBFalse = 0;
-
-      for (const date of sortedDates) {
-        const valA = dataA.get(date);
-        const valB = dataB.get(date);
-
-        if (valA === undefined || valB === undefined) continue;
-
-        const aTrue = valA != null && valA !== 0;
-        const bTrue = valB != null && valB !== 0;
-
-        if (aTrue && bTrue) aTrueBTrue++;
-        else if (aTrue && !bTrue) aTrueBFalse++;
-        else if (!aTrue && bTrue) aFalseBTrue++;
-        else aFalseBFalse++;
+  const { results: relationships, tested: testedPairs } = analyzeRelationships(engineMetrics, series, inputs);
+  for (const r of relationships) {
+    if (r.kind === "checkbox_numeric") {
+      const pd = pctDiff(r.avgTrue, r.avgFalse);
+      const common = {
+        involvesPrivate: priv(r.trigger.metric_id, r.outcome.metric_id),
+        direction: (r.avgTrue >= r.avgFalse ? "higher" : "lower") as "higher" | "lower",
+        percentDiff: r1(pd),
+        daysTrue: r.nTrue,
+        daysFalse: r.nFalse,
+        stats: r.stats,
+      };
+      if (r.lag === 0) {
+        checkboxNumericInsights.push({
+          type: "checkbox_numeric",
+          id: `cn:${r.trigger.metric_id}:${r.outcome.metric_id}`,
+          checkboxMetricId: r.trigger.metric_id,
+          checkboxMetricName: r.trigger.metric_name,
+          numericMetricId: r.outcome.metric_id,
+          numericMetricName: r.outcome.metric_name,
+          numericMetricType: r.outcome.type,
+          avgWhenTrue: r2(r.avgTrue),
+          avgWhenFalse: r2(r.avgFalse),
+          numericHigherIsBetter: r.outcome.higherIsBetter,
+          ...common,
+        });
+      } else {
+        timeLaggedInsights.push({
+          type: "time_lagged",
+          // Lag-1 keeps the original id so earlier dismissals still apply.
+          id: `tl:${r.trigger.metric_id}:${r.outcome.metric_id}${r.lag === 1 ? "" : `:${r.lag}`}`,
+          lag: r.lag,
+          triggerMetricId: r.trigger.metric_id,
+          triggerMetricName: r.trigger.metric_name,
+          outcomeMetricId: r.outcome.metric_id,
+          outcomeMetricName: r.outcome.metric_name,
+          outcomeMetricType: r.outcome.type,
+          avgNextDayWhenTrue: r2(r.avgTrue),
+          avgNextDayWhenFalse: r2(r.avgFalse),
+          outcomeHigherIsBetter: r.outcome.higherIsBetter,
+          ...common,
+        });
       }
-
-      const daysATrue = aTrueBTrue + aTrueBFalse;
-      const daysAFalse = aFalseBTrue + aFalseBFalse;
-
-      if (daysATrue < MIN_DAYS_EACH_GROUP || daysAFalse < MIN_DAYS_EACH_GROUP) {
-        continue;
-      }
-
-      const rateWhenATrue = daysATrue > 0 ? (aTrueBTrue / daysATrue) * 100 : 0;
-      const rateWhenAFalse =
-        daysAFalse > 0 ? (aFalseBTrue / daysAFalse) * 100 : 0;
-
-      const percentDiff = rateWhenATrue - rateWhenAFalse;
-
-      if (Math.abs(percentDiff) < MIN_PERCENT_DIFF) continue;
-
+    } else if (r.kind === "checkbox_checkbox") {
       checkboxCheckboxInsights.push({
         type: "checkbox_checkbox",
-        id: `cc:${metricA.metric_id}:${metricB.metric_id}`,
-        metricAId: metricA.metric_id,
-        metricAName: metricA.metric_name || metricA.metric_id,
-        metricBId: metricB.metric_id,
-        metricBName: metricB.metric_name || metricB.metric_id,
-        rateWhenATrue: Math.round(rateWhenATrue * 10) / 10,
-        rateWhenAFalse: Math.round(rateWhenAFalse * 10) / 10,
-        percentDiff: Math.round(percentDiff * 10) / 10,
-        daysATrue,
-        daysAFalse,
-        involvesPrivate:
-          privateMetricIds.has(metricA.metric_id) ||
-          privateMetricIds.has(metricB.metric_id),
+        id: `cc:${r.a.metric_id}:${r.b.metric_id}`,
+        metricAId: r.a.metric_id,
+        metricAName: r.a.metric_name,
+        metricBId: r.b.metric_id,
+        metricBName: r.b.metric_name,
+        rateWhenATrue: r1(r.rateTrue * 100),
+        rateWhenAFalse: r1(r.rateFalse * 100),
+        percentDiff: r1((r.rateTrue - r.rateFalse) * 100),
+        daysATrue: r.nTrue,
+        daysAFalse: r.nFalse,
+        involvesPrivate: priv(r.a.metric_id, r.b.metric_id),
+        stats: r.stats,
       });
-    }
-  }
-
-  checkboxCheckboxInsights.sort(
-    (a, b) => Math.abs(b.percentDiff) - Math.abs(a.percentDiff)
-  );
-
-  // 3) Numeric → Numeric correlations (Pearson)
-  const numericNumericInsights: NumericNumericInsight[] = [];
-  const MIN_OVERLAP_DAYS = 14;
-  const MIN_CORRELATION = 0.3;
-
-  for (let i = 0; i < numericMetrics.length; i++) {
-    for (let j = i + 1; j < numericMetrics.length; j++) {
-      const mA = numericMetrics[i];
-      const mB = numericMetrics[j];
-
-      const depsA = calculatedDependencies.get(mA.metric_id);
-      const depsB = calculatedDependencies.get(mB.metric_id);
-      if (depsA && depsA.has(mB.metric_id)) continue;
-      if (depsB && depsB.has(mA.metric_id)) continue;
-
-      const dataA = byMetric.get(mA.metric_id);
-      const dataB = byMetric.get(mB.metric_id);
-      if (!dataA || !dataB) continue;
-
-      const pairs: { a: number; b: number }[] = [];
-      for (const date of sortedDates) {
-        const vA = dataA.get(date);
-        const vB = dataB.get(date);
-        if (vA != null && vB != null) {
-          pairs.push({ a: vA, b: vB });
-        }
-      }
-
-      if (pairs.length < MIN_OVERLAP_DAYS) continue;
-
-      const n = pairs.length;
-      let sumA = 0,
-        sumB = 0,
-        sumAB = 0,
-        sumA2 = 0,
-        sumB2 = 0;
-      for (const p of pairs) {
-        sumA += p.a;
-        sumB += p.b;
-        sumAB += p.a * p.b;
-        sumA2 += p.a * p.a;
-        sumB2 += p.b * p.b;
-      }
-
-      const denom = Math.sqrt(
-        (n * sumA2 - sumA * sumA) * (n * sumB2 - sumB * sumB)
-      );
-      if (denom === 0) continue;
-
-      const r = (n * sumAB - sumA * sumB) / denom;
-      if (Math.abs(r) < MIN_CORRELATION) continue;
-
+    } else {
       numericNumericInsights.push({
         type: "numeric_numeric",
-        id: `nn:${mA.metric_id}:${mB.metric_id}`,
-        metricAId: mA.metric_id,
-        metricAName: mA.metric_name || mA.metric_id,
-        metricBId: mB.metric_id,
-        metricBName: mB.metric_name || mB.metric_id,
-        correlation: Math.round(r * 1000) / 1000,
-        direction: r > 0 ? "positive" : "negative",
-        daysOverlap: n,
-        involvesPrivate:
-          privateMetricIds.has(mA.metric_id) ||
-          privateMetricIds.has(mB.metric_id),
-        metricAHigherIsBetter: higherIsBetterMap.get(mA.metric_id) ?? true,
-        metricBHigherIsBetter: higherIsBetterMap.get(mB.metric_id) ?? true,
+        id: `${r.lag === 0 ? "nn" : "nn1"}:${r.a.metric_id}:${r.b.metric_id}`,
+        lag: r.lag,
+        metricAId: r.a.metric_id,
+        metricAName: r.a.metric_name,
+        metricAType: r.a.type,
+        metricBId: r.b.metric_id,
+        metricBName: r.b.metric_name,
+        metricBType: r.b.type,
+        correlation: Math.round(r.stats.effect * 1000) / 1000,
+        direction: r.stats.effect > 0 ? "positive" : "negative",
+        daysOverlap: r.n,
+        involvesPrivate: priv(r.a.metric_id, r.b.metric_id),
+        metricAHigherIsBetter: r.a.higherIsBetter,
+        metricBHigherIsBetter: r.b.higherIsBetter,
+        stats: r.stats,
       });
     }
   }
 
-  numericNumericInsights.sort(
-    (a, b) => Math.abs(b.correlation) - Math.abs(a.correlation)
-  );
+  const DAY_NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+  const dayOfWeekInsights: DayOfWeekInsight[] = analyzeDayOfWeek(engineMetrics, series).map((d) => ({
+    type: "day_of_week",
+    id: `dow:${d.metric.metric_id}`,
+    metricId: d.metric.metric_id,
+    metricName: d.metric.metric_name,
+    metricType: d.metric.type,
+    bestDay: DAY_NAMES[d.best],
+    worstDay: DAY_NAMES[d.worst],
+    bestAvg: r2(d.dayAverages[d.best]),
+    worstAvg: r2(d.dayAverages[d.worst]),
+    overallAvg: r2(d.overall),
+    dayAverages: DAY_NAMES.map((day, i) => ({ day, avg: r2(d.dayAverages[i]) })),
+    involvesPrivate: priv(d.metric.metric_id),
+    higherIsBetter: d.metric.higherIsBetter,
+    q: d.q,
+    evidence: d.evidence,
+    score: d.score,
+  }));
 
-  // 4) Time-lagged: checkbox today → numeric tomorrow
-  const timeLaggedInsights: TimeLaggedInsight[] = [];
-
-  const dateSet = new Set(sortedDates);
-
-  for (const cb of checkboxMetrics) {
-    const cbData = byMetric.get(cb.metric_id);
-    if (!cbData) continue;
-
-    for (const num of numericMetrics) {
-      const numData = byMetric.get(num.metric_id);
-      if (!numData) continue;
-
-      const nextDayWhenTrue: number[] = [];
-      const nextDayWhenFalse: number[] = [];
-
-      for (const date of sortedDates) {
-        const cbVal = cbData.get(date);
-        const d = new Date(date + "T00:00:00");
-        d.setDate(d.getDate() + 1);
-        const nextDate = d.toISOString().slice(0, 10);
-
-        if (!dateSet.has(nextDate)) continue;
-        const nextVal = numData.get(nextDate);
-        if (nextVal == null) continue;
-
-        const isTrue = cbVal != null && cbVal !== 0;
-        if (isTrue) {
-          nextDayWhenTrue.push(nextVal);
-        } else {
-          nextDayWhenFalse.push(nextVal);
-        }
-      }
-
-      if (
-        nextDayWhenTrue.length < MIN_DAYS_EACH_GROUP ||
-        nextDayWhenFalse.length < MIN_DAYS_EACH_GROUP
-      )
-        continue;
-
-      const avgTrue =
-        nextDayWhenTrue.reduce((a, b) => a + b, 0) / nextDayWhenTrue.length;
-      const avgFalse =
-        nextDayWhenFalse.reduce((a, b) => a + b, 0) / nextDayWhenFalse.length;
-
-      if (avgFalse === 0 && avgTrue === 0) continue;
-
-      const pctDiff =
-        avgFalse !== 0
-          ? ((avgTrue - avgFalse) / Math.abs(avgFalse)) * 100
-          : avgTrue > 0
-          ? 100
-          : -100;
-
-      if (Math.abs(pctDiff) < MIN_PERCENT_DIFF) continue;
-
-      timeLaggedInsights.push({
-        type: "time_lagged",
-        id: `tl:${cb.metric_id}:${num.metric_id}`,
-        triggerMetricId: cb.metric_id,
-        triggerMetricName: cb.metric_name || cb.metric_id,
-        outcomeMetricId: num.metric_id,
-        outcomeMetricName: num.metric_name || num.metric_id,
-        avgNextDayWhenTrue: Math.round(avgTrue * 100) / 100,
-        avgNextDayWhenFalse: Math.round(avgFalse * 100) / 100,
-        percentDiff: Math.round(pctDiff * 10) / 10,
-        direction: pctDiff > 0 ? "higher" : "lower",
-        daysTrue: nextDayWhenTrue.length,
-        daysFalse: nextDayWhenFalse.length,
-        involvesPrivate:
-          privateMetricIds.has(cb.metric_id) ||
-          privateMetricIds.has(num.metric_id),
-        outcomeHigherIsBetter: higherIsBetterMap.get(num.metric_id) ?? true,
-      });
-    }
-  }
-
-  timeLaggedInsights.sort(
-    (a, b) => Math.abs(b.percentDiff) - Math.abs(a.percentDiff)
-  );
-
-  // 5) Day-of-week patterns
-  const dayOfWeekInsights: DayOfWeekInsight[] = [];
-  const DAY_NAMES = [
-    "Sunday",
-    "Monday",
-    "Tuesday",
-    "Wednesday",
-    "Thursday",
-    "Friday",
-    "Saturday",
-  ];
-  const MIN_DAYS_PER_DOW = 4;
-  const MIN_DOW_DIFF = 10;
-
-  for (const m of numericMetrics) {
-    const mData = byMetric.get(m.metric_id);
-    if (!mData) continue;
-
-    const byDay: number[][] = [[], [], [], [], [], [], []];
-    for (const date of sortedDates) {
-      const val = mData.get(date);
-      if (val == null) continue;
-      const dow = new Date(date + "T00:00:00").getDay();
-      byDay[dow].push(val);
-    }
-
-    const hasEnoughData = byDay.every((d) => d.length >= MIN_DAYS_PER_DOW);
-    if (!hasEnoughData) continue;
-
-    const dayAvgs = byDay.map(
-      (vals) => vals.reduce((a, b) => a + b, 0) / vals.length
-    );
-    const allVals = byDay.flat();
-    const overallAvg = allVals.reduce((a, b) => a + b, 0) / allVals.length;
-
-    if (overallAvg === 0) continue;
-
-    const hib = higherIsBetterMap.get(m.metric_id) ?? true;
-    let bestIdx = 0;
-    let worstIdx = 0;
-    for (let i = 1; i < 7; i++) {
-      if (hib) {
-        if (dayAvgs[i] > dayAvgs[bestIdx]) bestIdx = i;
-        if (dayAvgs[i] < dayAvgs[worstIdx]) worstIdx = i;
-      } else {
-        if (dayAvgs[i] < dayAvgs[bestIdx]) bestIdx = i;
-        if (dayAvgs[i] > dayAvgs[worstIdx]) worstIdx = i;
-      }
-    }
-
-    const bestPctDiff =
-      ((dayAvgs[bestIdx] - overallAvg) / Math.abs(overallAvg)) * 100;
-    const worstPctDiff =
-      ((dayAvgs[worstIdx] - overallAvg) / Math.abs(overallAvg)) * 100;
-
-    if (
-      Math.abs(bestPctDiff) < MIN_DOW_DIFF &&
-      Math.abs(worstPctDiff) < MIN_DOW_DIFF
-    )
-      continue;
-
-    dayOfWeekInsights.push({
-      type: "day_of_week",
-      id: `dow:${m.metric_id}`,
-      metricId: m.metric_id,
-      metricName: m.metric_name || m.metric_id,
-      metricType: m.type,
-      bestDay: DAY_NAMES[bestIdx],
-      worstDay: DAY_NAMES[worstIdx],
-      bestAvg: Math.round(dayAvgs[bestIdx] * 100) / 100,
-      worstAvg: Math.round(dayAvgs[worstIdx] * 100) / 100,
-      overallAvg: Math.round(overallAvg * 100) / 100,
-      dayAverages: DAY_NAMES.map((name, i) => ({
-        day: name,
-        avg: Math.round(dayAvgs[i] * 100) / 100,
-      })),
-      involvesPrivate: privateMetricIds.has(m.metric_id),
-      higherIsBetter: higherIsBetterMap.get(m.metric_id) ?? true,
-    });
-  }
-
-  dayOfWeekInsights.sort((a, b) => {
-    const spreadA =
-      Math.abs((a.bestAvg - a.overallAvg) / a.overallAvg) +
-      Math.abs((a.worstAvg - a.overallAvg) / a.overallAvg);
-    const spreadB =
-      Math.abs((b.bestAvg - b.overallAvg) / b.overallAvg) +
-      Math.abs((b.worstAvg - b.overallAvg) / b.overallAvg);
-    return spreadB - spreadA;
-  });
-
-  // 6) Trend detection (recent 30 days vs prior 30 days)
-  const trendInsights: TrendInsight[] = [];
-  const TREND_WINDOW = 30;
-  const MIN_TREND_DAYS = 14;
-  const MIN_TREND_DIFF = 10;
-
-  if (sortedDates.length >= TREND_WINDOW) {
-    const today = sortedDates[sortedDates.length - 1];
-    const todayDate = new Date(today + "T00:00:00");
-    const recentCutoff = new Date(todayDate);
-    recentCutoff.setDate(recentCutoff.getDate() - TREND_WINDOW);
-    const priorCutoff = new Date(recentCutoff);
-    priorCutoff.setDate(priorCutoff.getDate() - TREND_WINDOW);
-
-    const recentCutoffStr = recentCutoff.toISOString().slice(0, 10);
-    const priorCutoffStr = priorCutoff.toISOString().slice(0, 10);
-
-    for (const m of numericMetrics) {
-      const mData = byMetric.get(m.metric_id);
-      if (!mData) continue;
-
-      const recentVals: number[] = [];
-      const priorVals: number[] = [];
-
-      for (const date of sortedDates) {
-        const val = mData.get(date);
-        if (val == null) continue;
-
-        if (date > recentCutoffStr) {
-          recentVals.push(val);
-        } else if (date > priorCutoffStr && date <= recentCutoffStr) {
-          priorVals.push(val);
-        }
-      }
-
-      if (recentVals.length < MIN_TREND_DAYS || priorVals.length < MIN_TREND_DAYS)
-        continue;
-
-      const recentAvg =
-        recentVals.reduce((a, b) => a + b, 0) / recentVals.length;
-      const priorAvg =
-        priorVals.reduce((a, b) => a + b, 0) / priorVals.length;
-
-      if (priorAvg === 0 && recentAvg === 0) continue;
-
-      const pctChange =
-        priorAvg !== 0
-          ? ((recentAvg - priorAvg) / Math.abs(priorAvg)) * 100
-          : recentAvg > 0
-          ? 100
-          : -100;
-
-      if (Math.abs(pctChange) < MIN_TREND_DIFF) continue;
-
-      trendInsights.push({
+  const trendInsights: TrendInsight[] = dateRange
+    ? analyzeTrends(engineMetrics, series, dateRange.last).map((t) => ({
         type: "trend",
-        id: `tr:${m.metric_id}`,
-        metricId: m.metric_id,
-        metricName: m.metric_name || m.metric_id,
-        metricType: m.type,
-        recentAvg: Math.round(recentAvg * 100) / 100,
-        priorAvg: Math.round(priorAvg * 100) / 100,
-        percentChange: Math.round(pctChange * 10) / 10,
-        direction: pctChange > 0 ? "up" : "down",
-        recentDays: recentVals.length,
-        priorDays: priorVals.length,
-        involvesPrivate: privateMetricIds.has(m.metric_id),
-        higherIsBetter: higherIsBetterMap.get(m.metric_id) ?? true,
-      });
-    }
-
-    trendInsights.sort(
-      (a, b) => Math.abs(b.percentChange) - Math.abs(a.percentChange)
-    );
-  }
+        id: `tr:${t.metric.metric_id}`,
+        metricId: t.metric.metric_id,
+        metricName: t.metric.metric_name,
+        metricType: t.metric.type,
+        recentAvg: r2(t.recentAvg),
+        priorAvg: r2(t.priorAvg),
+        percentChange: r1(pctDiff(t.recentAvg, t.priorAvg)),
+        direction: t.recentAvg >= t.priorAvg ? "up" : "down",
+        recentDays: t.nRecent,
+        priorDays: t.nPrior,
+        involvesPrivate: priv(t.metric.metric_id),
+        higherIsBetter: t.metric.higherIsBetter,
+        stats: t.stats,
+      }))
+    : [];
 
   // 7) Histogram / Distribution
   const histogramInsights: HistogramInsight[] = [];
@@ -955,6 +576,7 @@ export async function GET(req: Request) {
     candlesticks: candlestickInsights.slice(0, 8),
     totalDays,
     dateRange,
+    testedPairs,
   };
 
   return NextResponse.json(response);

@@ -11,6 +11,24 @@ export type InsightType =
   | "streak_timeline"
   | "candlestick";
 
+export type Evidence = "strong" | "moderate" | "suggestive";
+
+/**
+ * Significance info attached to relationship / trend insights.
+ * effect, low, high: estimate and 95% interval in natural units — a difference
+ * of averages, a difference of rates (0–1), or a correlation r.
+ * q: p-value after the Benjamini–Hochberg correction across everything tested.
+ */
+export type InsightEvidence = {
+  effect: number;
+  low: number;
+  high: number;
+  p: number;
+  q: number;
+  evidence: Evidence;
+  score: number;
+};
+
 export type Metric = {
   metric_id: string;
   metric_name: string | null;
@@ -20,7 +38,10 @@ export type Metric = {
   calc_expr: string | null;
   analytics_config: {
     higher_is_better?: boolean;
+    direction?: "increase" | "decrease" | "neutral";
   } | null;
+  start_date?: string | null;
+  required?: boolean | null;
 };
 
 export type LogRow = {
@@ -44,6 +65,8 @@ export type CorrelationInsight = {
   direction: "higher" | "lower";
   involvesPrivate: boolean;
   numericHigherIsBetter: boolean;
+  numericMetricType: string;
+  stats: InsightEvidence;
 };
 
 export type CheckboxCheckboxInsight = {
@@ -59,6 +82,7 @@ export type CheckboxCheckboxInsight = {
   daysATrue: number;
   daysAFalse: number;
   involvesPrivate: boolean;
+  stats: InsightEvidence;
 };
 
 export type NumericNumericInsight = {
@@ -74,6 +98,11 @@ export type NumericNumericInsight = {
   involvesPrivate: boolean;
   metricAHigherIsBetter: boolean;
   metricBHigherIsBetter: boolean;
+  /** 0 = same day; 1 = A today vs B the next day. */
+  lag: 0 | 1;
+  metricAType: string;
+  metricBType: string;
+  stats: InsightEvidence;
 };
 
 export type TimeLaggedInsight = {
@@ -91,6 +120,10 @@ export type TimeLaggedInsight = {
   daysFalse: number;
   involvesPrivate: boolean;
   outcomeHigherIsBetter: boolean;
+  /** Days between the checkbox and the outcome (1 = next day). */
+  lag: 1 | 2;
+  outcomeMetricType: string;
+  stats: InsightEvidence;
 };
 
 export type DayOfWeekInsight = {
@@ -107,6 +140,9 @@ export type DayOfWeekInsight = {
   dayAverages: { day: string; avg: number }[];
   involvesPrivate: boolean;
   higherIsBetter: boolean;
+  q: number;
+  evidence: Evidence;
+  score: number;
 };
 
 export type TrendInsight = {
@@ -123,6 +159,7 @@ export type TrendInsight = {
   priorDays: number;
   involvesPrivate: boolean;
   higherIsBetter: boolean;
+  stats: InsightEvidence;
 };
 
 export type HistogramInsight = {
@@ -206,6 +243,8 @@ export type InsightsResponse = {
   candlesticks: CandlestickInsight[];
   totalDays: number;
   dateRange: { first: string; last: string } | null;
+  /** How many relationships were tested (for the "N pairs tested" note). */
+  testedPairs?: number;
 };
 
 export type CustomInsightConfig = {

@@ -47,6 +47,22 @@ type GroupOption = "week" | "month" | "year";
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type DetailData = Record<string, any>;
 
+/** Lag encoded in relationship insight ids: tl:a:b (1 day), tl:a:b:2, nn1:a:b. */
+function lagFromInsightId(id: string | null): number | null {
+  if (!id) return null;
+  if (id.startsWith("nn1:")) return 1;
+  if (id.startsWith("nn:")) return 0;
+  if (id.startsWith("tl:")) {
+    const parts = id.split(":");
+    return parts.length > 3 ? Number(parts[3]) || 1 : 1;
+  }
+  return null;
+}
+
+function laterLabel(lag: number): string {
+  return lag === 1 ? "The day after" : `${lag} days after`;
+}
+
 function formatDate(dateStr: string): string {
   const [year, month, day] = dateStr.split("-");
   return `${month}/${day}/${year}`;
@@ -124,6 +140,8 @@ export function InsightDetailSheet({
         if (insightType === "candlestick") {
           params.set("period", candlestickPeriod);
         }
+        const lag = lagFromInsightId(insightId);
+        if (lag !== null) params.set("lag", String(lag));
         if (showPrivate) params.set("showPrivate", "true");
 
         const res = await fetch(`/api/insights/detail?${params}`, { headers });
@@ -138,7 +156,7 @@ export function InsightDetailSheet({
     })();
 
     return () => { cancelled = true; };
-  }, [open, insightType, metricIds, range, showPrivate, candlestickPeriod]);
+  }, [open, insightType, insightId, metricIds, range, showPrivate, candlestickPeriod]);
 
   const title = insightType
     ? {
@@ -751,7 +769,7 @@ function NumericNumericDetail({ data }: { data: DetailData }) {
   const points = data.points as { date: string; valueA: number; valueB: number }[];
   const correlation = data.correlation as number;
   const strength =
-    Math.abs(correlation) >= 0.7 ? "Strong" : Math.abs(correlation) >= 0.5 ? "Moderate" : "Weak";
+    Math.abs(correlation) >= 0.5 ? "Strong" : Math.abs(correlation) >= 0.3 ? "Moderate" : "Slight";
   const dir = correlation > 0 ? "positive" : "negative";
 
   return (
@@ -762,8 +780,14 @@ function NumericNumericDetail({ data }: { data: DetailData }) {
           {correlation.toFixed(3)}
         </p>
         <p className="text-sm text-muted-foreground mt-1">
-          {strength} {dir} correlation &middot; {points.length} overlapping days
+          {strength} {dir} link &middot; {points.length} {data.lag ? "day pairs" : "overlapping days"}
         </p>
+        <p className="text-xs text-muted-foreground mt-1">Compares the same weekdays, so weekly routines don&apos;t skew it.</p>
+        {data.lag ? (
+          <p className="text-xs text-muted-foreground mt-1">
+            {data.metricAName} on a day vs {data.metricBName} the next day
+          </p>
+        ) : null}
       </div>
       <Card>
         <CardContent className="px-2 pt-4 pb-2">
@@ -773,12 +797,16 @@ function NumericNumericDetail({ data }: { data: DetailData }) {
                 <CartesianGrid strokeDasharray="3 3" opacity={0.3} />
                 <XAxis
                   dataKey="valueA"
+                  type="number"
+                  domain={["auto", "auto"]}
                   name={data.metricAName}
                   tick={{ fontSize: 10 }}
                   label={{ value: data.metricAName, position: "insideBottom", offset: -15, fontSize: 11 }}
                 />
                 <YAxis
                   dataKey="valueB"
+                  type="number"
+                  domain={["auto", "auto"]}
                   name={data.metricBName}
                   tick={{ fontSize: 10 }}
                   label={{
@@ -904,7 +932,7 @@ function TimeLaggedDetail({ data }: { data: DetailData }) {
     <>
       <div className="text-center">
         <p className="text-sm text-muted-foreground">
-          The day after <span className="font-medium text-foreground">{data.triggerName}</span>
+          {laterLabel(data.lag ?? 1)} <span className="font-medium text-foreground">{data.triggerName}</span>
         </p>
         <p className="text-sm text-muted-foreground mt-1">
           <span className="font-medium text-foreground">{data.outcomeName}</span> averages

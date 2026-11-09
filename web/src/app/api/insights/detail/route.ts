@@ -1,6 +1,9 @@
 import { NextResponse } from "next/server";
 import { supabaseServerFromRequest } from "@/lib/supabaseServer";
 import { getLocalDateString, getServerTimezone } from "@/lib/dateUtils";
+import { fetchAllRows } from "@/lib/fetchAllRows";
+import { buildSeries, metricHigherIsBetter, pairPoints, trackedDaysFrom, type EngineMetric } from "@/lib/insights/engine";
+import { demeanByStratum, pearson } from "@/lib/insights/stats";
 
 type LogRow = {
   metric_id: string;
@@ -12,8 +15,76 @@ type MetricConfig = {
   metric_id: string;
   metric_name: string | null;
   type: string;
-  analytics_config: { higher_is_better?: boolean } | null;
+  analytics_config: { higher_is_better?: boolean; direction?: string } | null;
+  start_date?: string | null;
 };
+
+const RELATIONSHIP_TYPES = new Set(["numeric_numeric", "checkbox_numeric", "time_lagged", "checkbox_checkbox"]);
+
+const avg = (xs: number[]) => (xs.length > 0 ? Math.round((xs.reduce((s, x) => s + x, 0) / xs.length) * 100) / 100 : 0);
+
+/** Detail payloads for the four relationship insights (same shapes the sheet expects). */
+function relationshipDetail(
+  type: string,
+  lag: number,
+  a: EngineMetric,
+  b: EngineMetric,
+  pts: { date: string; a: number; b: number }[]
+) {
+  if (type === "numeric_numeric") {
+    // Same weekday-adjusted (partial) correlation as the feed card.
+    const strata = pts.map((p) => new Date(`${p.date}T00:00:00`).getDay());
+    const r = pearson(demeanByStratum(pts.map((p) => p.a), strata), demeanByStratum(pts.map((p) => p.b), strata));
+    return NextResponse.json({
+      points: pts.map((p) => ({ date: p.date, valueA: p.a, valueB: p.b })),
+      metricAName: a.metric_name,
+      metricBName: b.metric_name,
+      correlation: Number.isFinite(r) ? Math.round(r * 1000) / 1000 : 0,
+      metricAHigherIsBetter: a.higherIsBetter,
+      metricBHigherIsBetter: b.higherIsBetter,
+      lag,
+    });
+  }
+  if (type === "checkbox_checkbox") {
+    const t = pts.filter((p) => p.a === 1);
+    const f = pts.filter((p) => p.a === 0);
+    const rate = (xs: typeof pts) => (xs.length > 0 ? Math.round((xs.filter((p) => p.b === 1).length / xs.length) * 1000) / 10 : 0);
+    return NextResponse.json({
+      rateWhenATrue: rate(t),
+      rateWhenAFalse: rate(f),
+      daysATrue: t.length,
+      daysAFalse: f.length,
+      dailyData: pts.map((p) => ({ date: p.date, a: p.a === 1, b: p.b === 1 })),
+      metricAName: a.metric_name,
+      metricBName: b.metric_name,
+    });
+  }
+  const whenTrue = pts.filter((p) => p.a === 1).map((p) => p.b);
+  const whenFalse = pts.filter((p) => p.a === 0).map((p) => p.b);
+  if (type === "time_lagged") {
+    return NextResponse.json({
+      avgNextDayWhenTrue: avg(whenTrue),
+      avgNextDayWhenFalse: avg(whenFalse),
+      daysTrue: whenTrue.length,
+      daysFalse: whenFalse.length,
+      distribution: pts.map((p) => ({ date: p.date, nextDayValue: p.b, checkedToday: p.a === 1 })),
+      triggerName: a.metric_name,
+      outcomeName: b.metric_name,
+      outcomeHigherIsBetter: b.higherIsBetter,
+      lag,
+    });
+  }
+  return NextResponse.json({
+    avgWhenTrue: avg(whenTrue),
+    avgWhenFalse: avg(whenFalse),
+    daysTrue: whenTrue.length,
+    daysFalse: whenFalse.length,
+    distribution: pts.map((p) => ({ date: p.date, value: p.b, checked: p.a === 1 })),
+    checkboxName: a.metric_name,
+    numericName: b.metric_name,
+    numericHigherIsBetter: b.higherIsBetter,
+  });
+}
 
 export async function GET(req: Request) {
   const supabase = supabaseServerFromRequest(req);
@@ -51,7 +122,7 @@ export async function GET(req: Request) {
   // Validate metrics belong to user and get config
   const { data: configs, error: configError } = await supabase
     .from("config")
-    .select("metric_id, metric_name, type, analytics_config")
+    .select("metric_id, metric_name, type, analytics_config, start_date")
     .eq("owner_id", user.id)
     .in("metric_id", metricIds);
 
@@ -135,19 +206,53 @@ export async function GET(req: Request) {
 
   const sortedDates = Array.from(allDates).sort();
 
+  // Relationship types share the Insights engine so the sheet matches the card
+  // (tracked days, checkbox "not done" handling, lags).
+  if (RELATIONSHIP_TYPES.has(type) && metricIds.length === 2) {
+    const lag = Math.max(0, Math.min(2, parseInt(url.searchParams.get("lag") || "", 10) || (type === "time_lagged" ? 1 : 0)));
+    try {
+      const { data: req } = await supabase
+        .from("config")
+        .select("metric_id")
+        .eq("owner_id", user.id)
+        .eq("active", true)
+        .eq("required", true);
+      const requiredIds = new Set<string>((req ?? []).map((r: { metric_id: string }) => r.metric_id));
+      const loadIds = [...new Set([...metricIds, ...requiredIds])];
+      const rows = await fetchAllRows<LogRow>((withCount) =>
+        supabase
+          .from("log")
+          .select("metric_id, date, value", withCount ? { count: "exact" } : undefined)
+          .eq("owner_id", user.id)
+          .in("metric_id", loadIds)
+          .order("date", { ascending: true })
+          .order("metric_id", { ascending: true })
+      );
+      const engineMetrics: EngineMetric[] = metricIds.map((id) => {
+        const c = configMap.get(id)!;
+        return {
+          metric_id: id,
+          metric_name: c.metric_name || id,
+          type: c.type,
+          private: false,
+          higherIsBetter: metricHigherIsBetter(c.analytics_config),
+          trackedFrom: c.start_date ?? null,
+        };
+      });
+      const series = buildSeries(engineMetrics, rows, trackedDaysFrom(rows, requiredIds));
+      const [a, b] = engineMetrics;
+      const pts = pairPoints(series.get(a.metric_id) ?? new Map(), series.get(b.metric_id) ?? new Map(), lag);
+      return relationshipDetail(type, lag, a, b, pts);
+    } catch (e) {
+      return NextResponse.json({ error: e instanceof Error ? e.message : String(e) }, { status: 500 });
+    }
+  }
+
   switch (type) {
-    case "numeric_numeric":
-      return handleNumericNumeric(metricIds, configMap, byMetric, sortedDates);
     case "trend":
       return handleTrend(metricIds[0], configMap, byMetric, sortedDates);
     case "day_of_week":
       return handleDayOfWeek(metricIds[0], configMap, byMetric, sortedDates, dateFilter);
-    case "checkbox_numeric":
-      return handleCheckboxNumeric(metricIds, configMap, byMetric, sortedDates);
-    case "time_lagged":
-      return handleTimeLagged(metricIds, configMap, byMetric, sortedDates);
-    case "checkbox_checkbox":
-      return handleCheckboxCheckbox(metricIds, configMap, byMetric, sortedDates);
     case "histogram":
       return handleHistogram(metricIds[0], configMap, byMetric, sortedDates);
     case "cumulative":
@@ -161,55 +266,6 @@ export async function GET(req: Request) {
     default:
       return NextResponse.json({ error: "Unknown insight type" }, { status: 400 });
   }
-}
-
-function handleNumericNumeric(
-  metricIds: string[],
-  configMap: Map<string, MetricConfig>,
-  byMetric: Map<string, Map<string, number | null>>,
-  sortedDates: string[]
-) {
-  const [idA, idB] = metricIds;
-  const dataA = byMetric.get(idA);
-  const dataB = byMetric.get(idB);
-  const cfgA = configMap.get(idA)!;
-  const cfgB = configMap.get(idB)!;
-
-  const points: { date: string; valueA: number; valueB: number }[] = [];
-  let sumA = 0, sumB = 0, sumAB = 0, sumA2 = 0, sumB2 = 0;
-
-  for (const date of sortedDates) {
-    const vA = dataA?.get(date);
-    const vB = dataB?.get(date);
-    if (vA != null && vB != null) {
-      points.push({ date, valueA: vA, valueB: vB });
-      sumA += vA;
-      sumB += vB;
-      sumAB += vA * vB;
-      sumA2 += vA * vA;
-      sumB2 += vB * vB;
-    }
-  }
-
-  const n = points.length;
-  let correlation = 0;
-  if (n > 1) {
-    const denom = Math.sqrt(
-      (n * sumA2 - sumA * sumA) * (n * sumB2 - sumB * sumB)
-    );
-    if (denom > 0) {
-      correlation = Math.round(((n * sumAB - sumA * sumB) / denom) * 1000) / 1000;
-    }
-  }
-
-  return NextResponse.json({
-    points,
-    metricAName: cfgA.metric_name || idA,
-    metricBName: cfgB.metric_name || idB,
-    correlation,
-    metricAHigherIsBetter: cfgA.analytics_config?.higher_is_better !== false,
-    metricBHigherIsBetter: cfgB.analytics_config?.higher_is_better !== false,
-  });
 }
 
 function handleTrend(
@@ -251,7 +307,7 @@ function handleTrend(
     metricName: cfg.metric_name || metricId,
     metricType: cfg.type,
     overallAvg,
-    higherIsBetter: cfg.analytics_config?.higher_is_better !== false,
+    higherIsBetter: metricHigherIsBetter(cfg.analytics_config),
   });
 }
 
@@ -302,159 +358,7 @@ function handleDayOfWeek(
     metricName: cfg.metric_name || metricId,
     metricType: cfg.type,
     overallAvg,
-    higherIsBetter: cfg.analytics_config?.higher_is_better !== false,
-  });
-}
-
-function handleCheckboxNumeric(
-  metricIds: string[],
-  configMap: Map<string, MetricConfig>,
-  byMetric: Map<string, Map<string, number | null>>,
-  sortedDates: string[]
-) {
-  const [cbId, numId] = metricIds;
-  const cbData = byMetric.get(cbId);
-  const numData = byMetric.get(numId);
-  const cfgCb = configMap.get(cbId)!;
-  const cfgNum = configMap.get(numId)!;
-
-  const distribution: { date: string; value: number; checked: boolean }[] = [];
-  const whenTrue: number[] = [];
-  const whenFalse: number[] = [];
-
-  for (const date of sortedDates) {
-    const cbVal = cbData?.get(date);
-    const numVal = numData?.get(date);
-    if (numVal == null) continue;
-
-    const checked = cbVal != null && cbVal !== 0;
-    distribution.push({ date, value: numVal, checked });
-
-    if (checked) {
-      whenTrue.push(numVal);
-    } else {
-      whenFalse.push(numVal);
-    }
-  }
-
-  const avgWhenTrue = whenTrue.length > 0
-    ? Math.round((whenTrue.reduce((a, b) => a + b, 0) / whenTrue.length) * 100) / 100
-    : 0;
-  const avgWhenFalse = whenFalse.length > 0
-    ? Math.round((whenFalse.reduce((a, b) => a + b, 0) / whenFalse.length) * 100) / 100
-    : 0;
-
-  return NextResponse.json({
-    avgWhenTrue,
-    avgWhenFalse,
-    daysTrue: whenTrue.length,
-    daysFalse: whenFalse.length,
-    distribution,
-    checkboxName: cfgCb.metric_name || cbId,
-    numericName: cfgNum.metric_name || numId,
-    numericHigherIsBetter: cfgNum.analytics_config?.higher_is_better !== false,
-  });
-}
-
-function handleTimeLagged(
-  metricIds: string[],
-  configMap: Map<string, MetricConfig>,
-  byMetric: Map<string, Map<string, number | null>>,
-  sortedDates: string[]
-) {
-  const [cbId, numId] = metricIds;
-  const cbData = byMetric.get(cbId);
-  const numData = byMetric.get(numId);
-  const cfgCb = configMap.get(cbId)!;
-  const cfgNum = configMap.get(numId)!;
-
-  const dateSet = new Set(sortedDates);
-  const distribution: { date: string; nextDayValue: number; checkedToday: boolean }[] = [];
-  const whenTrue: number[] = [];
-  const whenFalse: number[] = [];
-
-  for (const date of sortedDates) {
-    const cbVal = cbData?.get(date);
-    const d = new Date(date + "T00:00:00");
-    d.setDate(d.getDate() + 1);
-    const nextDate = d.toISOString().slice(0, 10);
-
-    if (!dateSet.has(nextDate)) continue;
-    const nextVal = numData?.get(nextDate);
-    if (nextVal == null) continue;
-
-    const checked = cbVal != null && cbVal !== 0;
-    distribution.push({ date, nextDayValue: nextVal, checkedToday: checked });
-
-    if (checked) {
-      whenTrue.push(nextVal);
-    } else {
-      whenFalse.push(nextVal);
-    }
-  }
-
-  const avgNextDayWhenTrue = whenTrue.length > 0
-    ? Math.round((whenTrue.reduce((a, b) => a + b, 0) / whenTrue.length) * 100) / 100
-    : 0;
-  const avgNextDayWhenFalse = whenFalse.length > 0
-    ? Math.round((whenFalse.reduce((a, b) => a + b, 0) / whenFalse.length) * 100) / 100
-    : 0;
-
-  return NextResponse.json({
-    avgNextDayWhenTrue,
-    avgNextDayWhenFalse,
-    daysTrue: whenTrue.length,
-    daysFalse: whenFalse.length,
-    distribution,
-    triggerName: cfgCb.metric_name || cbId,
-    outcomeName: cfgNum.metric_name || numId,
-    outcomeHigherIsBetter: cfgNum.analytics_config?.higher_is_better !== false,
-  });
-}
-
-function handleCheckboxCheckbox(
-  metricIds: string[],
-  configMap: Map<string, MetricConfig>,
-  byMetric: Map<string, Map<string, number | null>>,
-  sortedDates: string[]
-) {
-  const [idA, idB] = metricIds;
-  const dataA = byMetric.get(idA);
-  const dataB = byMetric.get(idB);
-  const cfgA = configMap.get(idA)!;
-  const cfgB = configMap.get(idB)!;
-
-  let aTrueBTrue = 0, aTrueBFalse = 0, aFalseBTrue = 0, aFalseBFalse = 0;
-  const dailyData: { date: string; a: boolean; b: boolean }[] = [];
-
-  for (const date of sortedDates) {
-    const valA = dataA?.get(date);
-    const valB = dataB?.get(date);
-    if (valA === undefined || valB === undefined) continue;
-
-    const aTrue = valA != null && valA !== 0;
-    const bTrue = valB != null && valB !== 0;
-    dailyData.push({ date, a: aTrue, b: bTrue });
-
-    if (aTrue && bTrue) aTrueBTrue++;
-    else if (aTrue && !bTrue) aTrueBFalse++;
-    else if (!aTrue && bTrue) aFalseBTrue++;
-    else aFalseBFalse++;
-  }
-
-  const daysATrue = aTrueBTrue + aTrueBFalse;
-  const daysAFalse = aFalseBTrue + aFalseBFalse;
-  const rateWhenATrue = daysATrue > 0 ? Math.round((aTrueBTrue / daysATrue) * 1000) / 10 : 0;
-  const rateWhenAFalse = daysAFalse > 0 ? Math.round((aFalseBTrue / daysAFalse) * 1000) / 10 : 0;
-
-  return NextResponse.json({
-    rateWhenATrue,
-    rateWhenAFalse,
-    daysATrue,
-    daysAFalse,
-    dailyData,
-    metricAName: cfgA.metric_name || idA,
-    metricBName: cfgB.metric_name || idB,
+    higherIsBetter: metricHigherIsBetter(cfg.analytics_config),
   });
 }
 
@@ -474,7 +378,7 @@ function handleHistogram(
   }
 
   if (values.length === 0) {
-    return NextResponse.json({ bins: [], stats: null, metricName: cfg.metric_name || metricId, metricType: cfg.type, higherIsBetter: cfg.analytics_config?.higher_is_better !== false });
+    return NextResponse.json({ bins: [], stats: null, metricName: cfg.metric_name || metricId, metricType: cfg.type, higherIsBetter: metricHigherIsBetter(cfg.analytics_config) });
   }
 
   const n = values.length;
@@ -535,7 +439,7 @@ function handleHistogram(
     },
     metricName: cfg.metric_name || metricId,
     metricType: cfg.type,
-    higherIsBetter: cfg.analytics_config?.higher_is_better !== false,
+    higherIsBetter: metricHigherIsBetter(cfg.analytics_config),
   });
 }
 
@@ -591,7 +495,7 @@ function handleCumulative(
     points,
     metricName: cfg.metric_name || metricId,
     metricType: cfg.type,
-    higherIsBetter: cfg.analytics_config?.higher_is_better !== false,
+    higherIsBetter: metricHigherIsBetter(cfg.analytics_config),
     currentTotal: Math.round(currentTotal * 100) / 100,
     dailyRate: Math.round(dailyRate * 100) / 100,
     projectedYearEnd: Math.round(projectedYearEnd),
@@ -656,7 +560,7 @@ function handleYearOverYear(
     years: yearsData,
     metricName: cfg.metric_name || metricId,
     metricType: cfg.type,
-    higherIsBetter: cfg.analytics_config?.higher_is_better !== false,
+    higherIsBetter: metricHigherIsBetter(cfg.analytics_config),
   });
 }
 
@@ -829,7 +733,7 @@ function handleCandlestick(
     candles,
     metricName: cfg.metric_name || metricId,
     metricType: cfg.type,
-    higherIsBetter: cfg.analytics_config?.higher_is_better !== false,
+    higherIsBetter: metricHigherIsBetter(cfg.analytics_config),
     overallAvg,
   });
 }
