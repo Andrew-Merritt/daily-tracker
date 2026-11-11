@@ -1,8 +1,75 @@
 import { createWorkout, resolveExerciseIds, type ExerciseInput } from "@/lib/domain/workouts";
+import type { SupabaseClient } from "@supabase/supabase-js";
 import { AgentInputError, type AgentTool } from "../types";
 
 const MAX_EXERCISES_PER_CALL = 40;
 const MAX_SETS_PER_EXERCISE = 40;
+
+/**
+ * PostgREST returns at most 1000 rows per request. Every read below is
+ * paginated against that ceiling rather than chunked by id count: chunking
+ * bounds how many ids go into one `in(...)`, which is not the same thing as
+ * bounding how many rows come back. 200 workouts' worth of exercises, or 200
+ * exercises' worth of sets, can exceed 1000 on their own, and the truncation
+ * is silent -- the affected workouts simply come back looking emptier than
+ * they are, with tonnage to match.
+ */
+const PAGE = 1000;
+/** How many ids go into one `in(...)` filter, to keep the URL a sane length. */
+const CHUNK = 200;
+
+/** Every page of a query, with errors raised rather than dropped. */
+async function fetchAllPages<T>(
+  build: (from: number, to: number) => PromiseLike<{ data: unknown; error: { message: string } | null }>,
+  what: string,
+): Promise<T[]> {
+  const all: T[] = [];
+  for (let offset = 0; ; offset += PAGE) {
+    const { data, error } = await build(offset, offset + PAGE - 1);
+    // A dropped error here does not surface as an error: it surfaces as a
+    // workout that appears to have no exercises, which reads as fact.
+    if (error) throw new Error(`${what}: ${error.message}`);
+    const page = (data ?? []) as T[];
+    all.push(...page);
+    if (page.length < PAGE) return all;
+  }
+}
+
+/**
+ * Rows from `table` whose `column` is in `ids`, chunked and fully paginated.
+ *
+ * Ordered by `orderCol` and then by id, because `range` pagination needs a
+ * total order: exercise_order and set_number both repeat heavily, and ties
+ * broken differently between two requests would let a row at a page boundary
+ * come back twice or not at all.
+ */
+async function fetchAllByIds<T>(
+  supabase: SupabaseClient,
+  table: string,
+  select: string,
+  column: string,
+  ids: string[],
+  orderCol: string,
+): Promise<T[]> {
+  const all: T[] = [];
+  for (let i = 0; i < ids.length; i += CHUNK) {
+    const chunk = ids.slice(i, i + CHUNK);
+    all.push(
+      ...(await fetchAllPages<T>(
+        (from, to) =>
+          supabase
+            .from(table)
+            .select(select)
+            .in(column, chunk)
+            .order(orderCol, { ascending: true })
+            .order("id", { ascending: true })
+            .range(from, to),
+        table,
+      )),
+    );
+  }
+  return all;
+}
 
 const getWorkouts: AgentTool = {
   name: "getWorkouts",
@@ -40,21 +107,39 @@ const getWorkouts: AgentTool = {
       start = startDate.toISOString().slice(0, 10);
     }
 
-    const { data: workouts, error: workoutsError } = await ctx.supabase
-      .from("workouts")
-      .select("id, date, workout_type, duration_minutes, rating, notes, body_weight, body_fat_pct")
-      .eq("owner_id", ctx.ownerId)
-      .gte("date", start)
-      .lte("date", end)
-      .order("date", { ascending: false });
+    // days maxes out at 3650, which over this history is thousands of rows --
+    // well past the 1000 PostgREST will return in one response. Unpaginated,
+    // a ten-year question silently answered with the most recent 1000
+    // workouts and looked complete.
+    type WorkoutRow = {
+      id: string;
+      date: string;
+      workout_type: string | null;
+      duration_minutes: number | null;
+      rating: number | null;
+      notes: string | null;
+      body_weight: number | null;
+      body_fat_pct: number | null;
+    };
+    const workouts = await fetchAllPages<WorkoutRow>(
+      (from, to) =>
+        ctx.supabase
+          .from("workouts")
+          .select("id, date, workout_type, duration_minutes, rating, notes, body_weight, body_fat_pct")
+          .eq("owner_id", ctx.ownerId)
+          .gte("date", start)
+          .lte("date", end)
+          .order("date", { ascending: false })
+          .order("id", { ascending: true })
+          .range(from, to),
+      "workouts",
+    );
 
-    if (workoutsError) throw new Error(workoutsError.message);
-    if (!workouts || workouts.length === 0) {
+    if (workouts.length === 0) {
       return { period: { start, end }, workouts: [] };
     }
 
     const workoutIds = workouts.map((w) => w.id);
-    const CHUNK = 200;
 
     type ExRow = {
       id: string;
@@ -63,16 +148,14 @@ const getWorkouts: AgentTool = {
       exercise_order: number;
       notes: string | null;
     };
-    const allExercises: ExRow[] = [];
-    for (let i = 0; i < workoutIds.length; i += CHUNK) {
-      const chunk = workoutIds.slice(i, i + CHUNK);
-      const { data } = await ctx.supabase
-        .from("workout_exercises")
-        .select("id, workout_id, exercise_name_display, exercise_order, notes")
-        .in("workout_id", chunk)
-        .order("exercise_order", { ascending: true });
-      if (data) allExercises.push(...(data as ExRow[]));
-    }
+    const allExercises = await fetchAllByIds<ExRow>(
+      ctx.supabase,
+      "workout_exercises",
+      "id, workout_id, exercise_name_display, exercise_order, notes",
+      "workout_id",
+      workoutIds,
+      "exercise_order",
+    );
 
     const exerciseIds = allExercises.map((e) => e.id);
 
@@ -84,16 +167,14 @@ const getWorkouts: AgentTool = {
       is_missed: boolean;
       set_type: string;
     };
-    const allSets: SetRow[] = [];
-    for (let i = 0; i < exerciseIds.length; i += CHUNK) {
-      const chunk = exerciseIds.slice(i, i + CHUNK);
-      const { data } = await ctx.supabase
-        .from("workout_sets")
-        .select("workout_exercise_id, set_number, reps, weight, is_missed, set_type")
-        .in("workout_exercise_id", chunk)
-        .order("set_number", { ascending: true });
-      if (data) allSets.push(...(data as SetRow[]));
-    }
+    const allSets = await fetchAllByIds<SetRow>(
+      ctx.supabase,
+      "workout_sets",
+      "workout_exercise_id, set_number, reps, weight, is_missed, set_type",
+      "workout_exercise_id",
+      exerciseIds,
+      "set_number",
+    );
 
     const setsByExercise = new Map<string, SetRow[]>();
     for (const s of allSets) {

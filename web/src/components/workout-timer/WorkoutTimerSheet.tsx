@@ -21,6 +21,8 @@ import {
   type AudioSettings,
   type SoundType,
   playTone,
+  isScreenOffAudioEnabled,
+  setScreenOffAudioEnabled,
 } from "@/hooks/useWorkoutTimer";
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -1063,6 +1065,16 @@ function TabataTab({
     });
   };
 
+  // Screen-off audio — persisted in the hook (it owns the audio route).
+  // On = sounds survive a long quiet block with the screen off, but Android
+  // hands audio focus to us and pauses music in other apps.
+  const [screenOffAudio, setScreenOffAudio] = useState(isScreenOffAudioEnabled);
+  const toggleScreenOffAudio = () => {
+    const next = !screenOffAudio;
+    setScreenOffAudio(next);
+    setScreenOffAudioEnabled(next); // called from a click = valid user gesture
+  };
+
   const { tabPhase, tabRunning, tabSelectedSplit, tabPhaseRemaining, tabCurrentCycle } = timer;
 
   // Fill fraction: completed work cycles + progress through current "on" phase
@@ -1162,6 +1174,22 @@ function TabataTab({
           <Button onClick={handleStart} className="w-28">Start</Button>
           <Button variant="ghost" onClick={() => setPendingSplit(null)}>← Back</Button>
         </div>
+
+        {/* Screen-off audio opt-in — see the audio-focus note in useWorkoutTimer */}
+        <label className="flex items-start gap-2 px-1 cursor-pointer select-none">
+          <input
+            type="checkbox"
+            checked={screenOffAudio}
+            onChange={toggleScreenOffAudio}
+            className="mt-0.5 shrink-0"
+          />
+          <span className="text-xs text-muted-foreground leading-snug">
+            Keep sounds alive with screen off
+            <span className="block opacity-70">
+              Needed for long quiet blocks, but pauses music in other apps.
+            </span>
+          </span>
+        </label>
 
         {/* Stopwatch — visible on ready screen too */}
         <StopwatchBox timer={timer} onSendToWorkout={onSendToWorkout} />

@@ -1,8 +1,7 @@
 import { NextResponse } from "next/server";
 import { supabaseAdmin } from "@/lib/supabaseAdmin";
-import { decrypt } from "@/lib/encryption";
 import { getLocalDateString } from "@/lib/dateUtils";
-import { refreshOuraToken, performOuraSync } from "@/lib/oura-sync";
+import { getOuraAccessToken, performOuraSync } from "@/lib/oura-sync";
 
 /**
  * GET /api/cron/oura-sync
@@ -52,24 +51,34 @@ export async function GET(req: Request) {
     console.log(`[CRON] Syncing Oura for user ${integration.owner_id} (${tz})`);
 
     try {
-      let accessToken = decrypt(integration.access_token);
-      if (integration.token_expires_at && new Date(integration.token_expires_at) < now) {
-        const newToken = await refreshOuraToken(supabaseAdmin, integration);
-        if (!newToken) {
-          console.error(`[CRON] Failed to refresh token for ${integration.owner_id}`);
-          continue;
-        }
-        accessToken = newToken;
+      const token = await getOuraAccessToken(supabaseAdmin, integration);
+      if (!token.ok) {
+        console.error(`[CRON] No usable Oura token for ${integration.owner_id}: ${token.error}`);
+        // Record the failure so it shows in Sync History. last_sync_at is left
+        // alone so tomorrow's run retries.
+        await supabaseAdmin
+          .from("integration_sync_log")
+          .insert({
+            integration_id: integration.id,
+            status: "error",
+            date_range_start: yesterday,
+            date_range_end: today,
+            started_at: now.toISOString(),
+            completed_at: new Date().toISOString(),
+            error_message: token.error,
+          });
+        continue;
       }
 
       const result = await performOuraSync(supabaseAdmin, {
         userId: integration.owner_id,
-        accessToken,
+        accessToken: token.accessToken,
         startDate: yesterday,
         endDate: today,
         metricMapping: syncConfig.metric_mapping || {},
         overwriteManual: syncConfig.overwrite_manual || false,
       });
+      if (token.warning) result.errors.push(token.warning);
 
       const completedAt = new Date().toISOString();
 

@@ -126,6 +126,7 @@ const SW_STORAGE_KEY = "workout_sw_state";
 const HIIT_STORAGE_KEY = "workout_hiit_state";
 const CU_PRESETS_KEY = "workout_cu_presets";
 const CU_STATE_KEY = "workout_cu_state";
+const SCREEN_OFF_AUDIO_KEY = "timer_screen_off_audio";
 
 const DEFAULT_CU_PRESET: CountUpPreset = {
   id: "default-countup",
@@ -214,10 +215,42 @@ function getMasterOut(ctx: AudioContext): AudioNode {
   return _masterGain;
 }
 
+// ─── Screen-off audio setting ───────────────────────────────────────────────────
+// The media-element route (below) is what keeps pre-scheduled sounds alive
+// through a long quiet block with the screen off — but starting an <audio>
+// element makes Chrome request *media* audio focus from Android, and Android
+// grants it by pausing whatever else holds it (e.g. Amazon Music). There is no
+// web API to play audio without requesting focus, and no way to detect that
+// another app is playing, so the tradeoff is the user's to make. Default off:
+// keep other apps' music playing. The keep-alive tone alone is enough for
+// multi-phase sessions, whose frequent beeps re-mark the tab audible.
+let _screenOffAudioCache: boolean | null = null;
+
+export function isScreenOffAudioEnabled(): boolean {
+  if (typeof window === "undefined") return false;
+  if (_screenOffAudioCache === null) {
+    try { _screenOffAudioCache = localStorage.getItem(SCREEN_OFF_AUDIO_KEY) === "true"; }
+    catch { _screenOffAudioCache = false; }
+  }
+  return _screenOffAudioCache;
+}
+
+/** Persist the setting. Call from a user gesture: enabling it mid-session needs
+ *  one to start the media element. */
+export function setScreenOffAudioEnabled(enabled: boolean) {
+  _screenOffAudioCache = enabled;
+  try { localStorage.setItem(SCREEN_OFF_AUDIO_KEY, String(enabled)); } catch {}
+  console.log("[timer] screen-off audio", enabled ? "enabled (will pause other apps' music)" : "disabled (other apps keep playing)");
+  if (!enabled) releaseMediaRoute();
+  else if (_hiitActive || _cuActive) ensureMediaRoute();
+}
+
 // Call from a user gesture (timer start/resume). Switches the master route to
-// the media element once playback is confirmed.
+// the media element once playback is confirmed. No-op unless the user opted in
+// — see the note above on Android audio focus.
 function ensureMediaRoute() {
   if (typeof window === "undefined" || _usingMediaEl) return;
+  if (!isScreenOffAudioEnabled()) return;
   try { getMasterOut(getCtx()); } catch { return; }
   if (!_mediaEl || !_mediaStreamDest || !_masterGain) return;
   _mediaEl.play().then(() => {
