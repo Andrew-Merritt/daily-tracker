@@ -38,6 +38,7 @@ export default function OuraIntegrationPage() {
   const searchParams = useSearchParams();
   const router = useRouter();
   const justConnected = searchParams.get("connected") === "1";
+  const justReconnected = searchParams.get("reconnected") === "1";
 
   const { toast, confirm } = useToast();
   const [config, setConfig] = useState<OuraConfig | null>(null);
@@ -45,6 +46,7 @@ export default function OuraIntegrationPage() {
   const [syncing, setSyncing] = useState(false);
   const [savingConfig, setSavingConfig] = useState(false);
   const [disconnecting, setDisconnecting] = useState(false);
+  const [reconnecting, setReconnecting] = useState(false);
 
   // Sync options
   const [syncStartDate, setSyncStartDate] = useState("");
@@ -152,6 +154,27 @@ export default function OuraIntegrationPage() {
     }
   };
 
+  // Re-runs Oura authorization; the callback replaces tokens and keeps settings.
+  const handleReconnect = async () => {
+    setReconnecting(true);
+    try {
+      const headers = await getAuthHeaders();
+      const res = await fetch("/api/integrations/oura/authorize", { headers });
+      const data = await res.json();
+
+      if (data.auth_url) {
+        window.location.href = data.auth_url;
+      } else {
+        toast(data.error || "Failed to start authorization", "error");
+        setReconnecting(false);
+      }
+    } catch (e) {
+      console.error("Failed to start Oura reconnect:", e);
+      toast("Failed to reconnect", "error");
+      setReconnecting(false);
+    }
+  };
+
   const handleDisconnect = async () => {
     if (!await confirm({ message: "Disconnect from Oura? This will not delete any synced data.", destructive: true, confirmLabel: "Disconnect" })) {
       return;
@@ -192,19 +215,35 @@ export default function OuraIntegrationPage() {
           <h1 className="text-2xl font-semibold">Oura Integration</h1>
           <Badge variant="default">Connected</Badge>
         </div>
-        <Button
-          variant="destructive"
-          size="sm"
-          onClick={handleDisconnect}
-          disabled={disconnecting}
-        >
-          {disconnecting ? "Disconnecting..." : "Disconnect"}
-        </Button>
+        <div className="flex items-center gap-2">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={handleReconnect}
+            disabled={reconnecting || disconnecting}
+          >
+            {reconnecting ? "Redirecting..." : "Reconnect"}
+          </Button>
+          <Button
+            variant="destructive"
+            size="sm"
+            onClick={handleDisconnect}
+            disabled={disconnecting || reconnecting}
+          >
+            {disconnecting ? "Disconnecting..." : "Disconnect"}
+          </Button>
+        </div>
       </div>
 
       {justConnected && (
         <div className="bg-green-50 border border-green-200 rounded-lg p-4 text-green-700">
           Successfully connected to Oura! Configure your metric mapping below to start syncing data.
+        </div>
+      )}
+
+      {justReconnected && (
+        <div className="bg-green-50 border border-green-200 rounded-lg p-4 text-green-700">
+          Reconnected to Oura. Your metric mapping and settings were kept.
         </div>
       )}
 
@@ -312,7 +351,7 @@ export default function OuraIntegrationPage() {
               {config.sync_history.map((log) => (
                 <div
                   key={log.id}
-                  className="flex items-center justify-between text-sm p-2 border rounded"
+                  className="flex flex-wrap items-center justify-between gap-y-1 text-sm p-2 border rounded"
                 >
                   <div>
                     <span className="font-mono text-xs">
@@ -334,6 +373,11 @@ export default function OuraIntegrationPage() {
                   <div className="text-muted-foreground">
                     {log.records_synced} records
                   </div>
+                  {log.error_message && (
+                    <div className="basis-full text-xs text-destructive break-words">
+                      {log.error_message}
+                    </div>
+                  )}
                 </div>
               ))}
             </div>

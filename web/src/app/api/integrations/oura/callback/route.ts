@@ -87,33 +87,45 @@ export async function GET(req: Request) {
     const encryptedAccessToken = encrypt(tokens.access_token);
     const encryptedRefreshToken = tokens.refresh_token ? encrypt(tokens.refresh_token) : null;
 
-    // Store integration
-    const { error: upsertError } = await supabase
+    // On reconnect, only replace tokens — keep the existing metric mapping and settings.
+    const { data: existing } = await supabase
       .from("integrations")
-      .upsert(
-        {
+      .select("id")
+      .eq("owner_id", user.id)
+      .eq("provider", "oura")
+      .maybeSingle();
+
+    const tokenFields = {
+      access_token: encryptedAccessToken,
+      refresh_token: encryptedRefreshToken,
+      token_expires_at: expiresAt.toISOString(),
+      scopes: tokens.scope?.split(" ") || [],
+      updated_at: new Date().toISOString(),
+    };
+
+    const { error: saveError } = existing
+      ? await supabase.from("integrations").update(tokenFields).eq("id", existing.id)
+      : await supabase.from("integrations").insert({
           owner_id: user.id,
           provider: "oura",
-          access_token: encryptedAccessToken,
-          refresh_token: encryptedRefreshToken,
-          token_expires_at: expiresAt.toISOString(),
-          scopes: tokens.scope?.split(" ") || [],
+          ...tokenFields,
           sync_config: {
             auto_sync: false,
             overwrite_manual: false,
             metric_mapping: {},
           },
-          updated_at: new Date().toISOString(),
-        },
-        { onConflict: "owner_id,provider" }
-      );
+        });
 
-    if (upsertError) {
-      console.error("Failed to save integration:", upsertError);
+    console.log(`[oura] ${existing ? "Reconnected" : "Connected"} Oura for user ${user.id}; token expires ${expiresAt.toISOString()}`);
+
+    if (saveError) {
+      console.error("Failed to save integration:", saveError);
       return NextResponse.redirect(new URL("/integrations?error=save_failed", req.url));
     }
 
-    return NextResponse.redirect(new URL("/integrations/oura?connected=1", req.url));
+    return NextResponse.redirect(
+      new URL(`/integrations/oura?${existing ? "reconnected" : "connected"}=1`, req.url)
+    );
   } catch (e) {
     console.error("Oura callback error:", e);
     return NextResponse.redirect(new URL("/integrations?error=callback_failed", req.url));

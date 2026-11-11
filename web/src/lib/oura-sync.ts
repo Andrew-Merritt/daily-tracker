@@ -42,13 +42,33 @@ export const OURA_DATA_TYPES: Record<string, {
   },
 };
 
+// Refresh this far ahead of expiry so a failed refresh still leaves days of
+// a working access token (and daily cron retries) before syncing breaks.
+const TOKEN_REFRESH_BUFFER_MS = 3 * 24 * 60 * 60 * 1000;
+
+type OuraIntegrationTokens = {
+  id: string;
+  access_token: string;
+  refresh_token: string | null;
+  token_expires_at: string | null;
+};
+
+type RefreshResult =
+  | { ok: true; accessToken: string; warning?: string }
+  | { ok: false; error: string };
+
 export async function refreshOuraToken(
   supabase: SupabaseClient,
-  integration: { id: string; refresh_token: string }
-): Promise<string | null> {
+  integration: OuraIntegrationTokens
+): Promise<RefreshResult> {
   const clientId = process.env.OURA_CLIENT_ID;
   const clientSecret = process.env.OURA_CLIENT_SECRET;
-  if (!clientId || !clientSecret || !integration.refresh_token) return null;
+  if (!clientId || !clientSecret) {
+    return { ok: false, error: "OURA_CLIENT_ID / OURA_CLIENT_SECRET not configured" };
+  }
+  if (!integration.refresh_token) {
+    return { ok: false, error: "No refresh token stored — reconnect Oura" };
+  }
 
   try {
     const res = await fetch(OURA_TOKEN_URL, {
@@ -62,13 +82,37 @@ export async function refreshOuraToken(
       }),
     });
 
-    if (!res.ok) return null;
+    if (!res.ok) {
+      const body = await res.text();
+      console.error(`[oura] Token refresh failed for integration ${integration.id}: ${res.status} ${body}`);
+
+      // Oura refresh tokens are single-use. If a concurrent sync already
+      // refreshed, our copy is stale — use the token it saved instead.
+      const { data: current } = await supabase
+        .from("integrations")
+        .select("access_token, refresh_token, token_expires_at")
+        .eq("id", integration.id)
+        .single();
+      if (
+        current &&
+        current.refresh_token !== integration.refresh_token &&
+        current.token_expires_at &&
+        new Date(current.token_expires_at) > new Date()
+      ) {
+        console.log(`[oura] Integration ${integration.id} was refreshed concurrently; using stored token (expires ${current.token_expires_at})`);
+        return { ok: true, accessToken: decrypt(current.access_token) };
+      }
+
+      return { ok: false, error: `Oura token refresh failed (${res.status}): ${body.slice(0, 200)}` };
+    }
+
     const tokens = await res.json();
 
     const expiresAt = new Date();
     expiresAt.setSeconds(expiresAt.getSeconds() + (tokens.expires_in || 86400));
+    console.log(`[oura] Refreshed token for integration ${integration.id}; new expiry ${expiresAt.toISOString()}, rotated refresh token: ${Boolean(tokens.refresh_token)}`);
 
-    await supabase
+    const { error: saveError } = await supabase
       .from("integrations")
       .update({
         access_token: encrypt(tokens.access_token),
@@ -80,11 +124,51 @@ export async function refreshOuraToken(
       })
       .eq("id", integration.id);
 
-    return tokens.access_token;
+    if (saveError) {
+      // The old refresh token is already spent, so the next refresh will fail.
+      // This sync can still proceed with the new access token.
+      console.error(`[oura] Refreshed token could not be saved for integration ${integration.id}:`, saveError);
+      return {
+        ok: true,
+        accessToken: tokens.access_token,
+        warning: `Refreshed Oura token could not be saved (${saveError.message}) — reconnect Oura before ${expiresAt.toISOString().slice(0, 10)}`,
+      };
+    }
+
+    return { ok: true, accessToken: tokens.access_token };
   } catch (e) {
-    console.error("Failed to refresh Oura token:", e);
-    return null;
+    console.error(`[oura] Token refresh threw for integration ${integration.id}:`, e);
+    return { ok: false, error: `Oura token refresh error: ${e instanceof Error ? e.message : "Unknown error"}` };
   }
+}
+
+/**
+ * Returns a usable access token, refreshing early when within
+ * TOKEN_REFRESH_BUFFER_MS of expiry. If an early refresh fails but the
+ * current token is still valid, syncs continue with a warning.
+ */
+export async function getOuraAccessToken(
+  supabase: SupabaseClient,
+  integration: OuraIntegrationTokens
+): Promise<RefreshResult> {
+  const expiresAt = integration.token_expires_at ? new Date(integration.token_expires_at) : null;
+  const now = Date.now();
+
+  if (!expiresAt || expiresAt.getTime() - now > TOKEN_REFRESH_BUFFER_MS) {
+    return { ok: true, accessToken: decrypt(integration.access_token) };
+  }
+
+  const stillValid = expiresAt.getTime() > now;
+  console.log(`[oura] Token for integration ${integration.id} expires ${expiresAt.toISOString()} (${stillValid ? "within refresh window" : "expired"}); refreshing`);
+
+  const refreshed = await refreshOuraToken(supabase, integration);
+  if (refreshed.ok || !stillValid) return refreshed;
+
+  return {
+    ok: true,
+    accessToken: decrypt(integration.access_token),
+    warning: `${refreshed.error}. Current token still works until ${expiresAt.toISOString().slice(0, 10)}; will retry next sync`,
+  };
 }
 
 export type SyncResult = {

@@ -1,8 +1,7 @@
 import { NextResponse } from "next/server";
 import { supabaseServerFromRequest } from "@/lib/supabaseServer";
-import { decrypt } from "@/lib/encryption";
 import { getLocalDateString, getServerTimezone } from "@/lib/dateUtils";
-import { refreshOuraToken, performOuraSync } from "@/lib/oura-sync";
+import { getOuraAccessToken, performOuraSync } from "@/lib/oura-sync";
 
 export async function POST(req: Request) {
   const supabase = supabaseServerFromRequest(req);
@@ -30,14 +29,21 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "Oura not connected" }, { status: 400 });
   }
 
-  let accessToken = decrypt(integration.access_token);
-  if (integration.token_expires_at && new Date(integration.token_expires_at) < new Date()) {
-    const newToken = await refreshOuraToken(supabase, integration);
-    if (!newToken) {
-      return NextResponse.json({ error: "Failed to refresh token" }, { status: 401 });
-    }
-    accessToken = newToken;
+  const token = await getOuraAccessToken(supabase, integration);
+  if (!token.ok) {
+    const now = new Date().toISOString();
+    await supabase.from("integration_sync_log").insert({
+      integration_id: integration.id,
+      status: "error",
+      started_at: now,
+      completed_at: now,
+      date_range_start: start_date,
+      date_range_end: end_date,
+      error_message: token.error,
+    });
+    return NextResponse.json({ error: `${token.error}. Try Reconnect.` }, { status: 401 });
   }
+  const accessToken = token.accessToken;
 
   // Create sync log entry
   const { data: syncLog } = await supabase
@@ -62,6 +68,7 @@ export async function POST(req: Request) {
     overwriteManual: syncConfig.overwrite_manual || false,
     dataTypes: data_types,
   });
+  if (token.warning) result.errors.push(token.warning);
 
   if (syncLog) {
     await supabase
